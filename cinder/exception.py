@@ -562,3 +562,15 @@ class InvalidBackup(Invalid):
 
 class SwiftConnectionFailed(CinderException):
     message = _("Connection to swift failed") + ": %(reason)s"
+
+
+class XtreemfsException(CinderException):
+    message = _("Xtreemfs miss-configuration")
+
+
+class XtreemfsNoSharesMounted(NotFound):
+    message = _("No mounted Xteemfs shares was found")
+
+
+class XtreemfsNoSuitableShareFound(NotFound):
+    messge = _("No share was found")
