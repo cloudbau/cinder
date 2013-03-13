@@ -569,8 +569,8 @@ class XtreemfsException(CinderException):
 
 
 class XtreemfsNoSharesMounted(NotFound):
-    message = _("No mounted Xteemfs shares was found")
+    message = _("No mounted Xtreemfs shares was found")
 
 
 class XtreemfsNoSuitableShareFound(NotFound):
-    messge = _("No share was found")
+    message = _("No share was found")
