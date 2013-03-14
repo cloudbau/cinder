@@ -573,4 +573,4 @@ class XtreemfsNoSharesMounted(NotFound):
 
 
 class XtreemfsNoSuitableShareFound(NotFound):
-    message = _("No share was found")
+    message = _("No suitable share was found to host %(volume_size)dG")
