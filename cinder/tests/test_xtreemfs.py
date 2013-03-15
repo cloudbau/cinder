@@ -62,7 +62,6 @@ class XtreemFsDriverTestCase(test.TestCase):
 
     def test_setup_without_shares_config_file(self):
         "Setup should raise an error if shares config wasn't set."
-        # Should raise an error if no shares config was given.
         self._config.xtreemfs_shares_config = ""
         self.assertRaises(
             exception.XtreemfsException,
@@ -112,7 +111,7 @@ class XtreemFsDriverTestCase(test.TestCase):
         )
 
     def test_find_shares_without_enough_space(self):
-        "Find share should raise an error if no share can  hold size given."
+        "Find share should raise an error if no share can hold size given."
         # Add dummy shares and mock the capacity to return 0 for each one.
         self._driver._mounted_shares = self.available_shares
         self._mocker.StubOutWithMock(self._driver, "_get_available_capacity")
@@ -200,8 +199,8 @@ class XtreemFsDriverTestCase(test.TestCase):
             self.mount_point,
             run_as_root=True
         ).AndReturn((cmd_output, None))
-        self._mocker.ReplayAll()
 
+        self._mocker.ReplayAll()
         self.assertEquals(
             total_size - used,
             self._driver._get_available_capacity(share)
@@ -209,10 +208,10 @@ class XtreemFsDriverTestCase(test.TestCase):
         self._mocker.VerifyAll()
 
     def test_ensure_share_mounted(self):
-        "Ensuring a shared mounted volume"
+        "Ensuring a shared mounted volume."
         # Mock getting mounting share to do nothing.
         share = self.available_shares[0]
-        #
+        # Mock driver to return dummy mount point.
         self._mocker.StubOutWithMock(
             self._driver, '_get_mount_point_for_share'
         )
@@ -244,7 +243,7 @@ class XtreemFsDriverTestCase(test.TestCase):
         self._mocker.VerifyAll()
 
     def test_ensure_shares_save_only_correct_share(self):
-        "Check that only shares that don't  raise any error get loaded."
+        "Check that only shares that don't raise any error get loaded."
         # Mock loading shared config to return dummy shares.
         self._mocker.StubOutWithMock(self._driver, '_load_shares_config')
         self._driver._load_shares_config().AndReturn(self.available_shares)
@@ -254,6 +253,7 @@ class XtreemFsDriverTestCase(test.TestCase):
                     .AndRaise(Exception())
         for share in self.available_shares[1:]:
             self._driver._ensure_share_mounted(share)
+
         self._mocker.ReplayAll()
         self._driver._ensure_shares_mounted()
         self.assertListEqual(
@@ -261,15 +261,36 @@ class XtreemFsDriverTestCase(test.TestCase):
         )
         self._mocker.VerifyAll()
 
+    def test_create_volume(self):
+        "The method that create a volume should return volume's location."
+        volume = _get_dummy_volume()
+         # Mock ensuring mounted volume to do nothing.
+        self._mocker.StubOutWithMock(self._driver, "_ensure_shares_mounted")
+        self._driver._ensure_shares_mounted()
+        # Mock creating a volume to do nothing.
+        self._mocker.StubOutWithMock(self._driver, "_do_create_volume")
+        self._driver._do_create_volume(volume)
+        # Mock finding share to return dummy share.
+        self._mocker.StubOutWithMock(self._driver, "_find_share")
+        self._driver._find_share(volume["size"]). \
+                     AndReturn(volume["provider_location"])
+
+        self._mocker.ReplayAll()
+        self.assertDictEqual(
+            {'provider_location': volume["provider_location"]},
+            self._driver.create_volume(volume)
+        )
+        self._mocker.VerifyAll()
+
     def test_create_sparse_volume(self):
         "Test creating a sparsed volume."
         volume = _get_dummy_volume()
-        # Mock method to create sparsed file and to set permission.
+        # Mock method to create sparsed file to do nothing.
         self._mocker.StubOutWithMock(self._driver, "_create_sparsed_file")
+        self._driver._create_sparsed_file(IgnoreArg(), IgnoreArg())
+        # Mock method to set permission to do nothing.
         self._mocker.StubOutWithMock(
             self._driver, "_set_rw_permissions_for_all")
-
-        self._driver._create_sparsed_file(IgnoreArg(), IgnoreArg())
         self._driver._set_rw_permissions_for_all(IgnoreArg())
 
         self._mocker.ReplayAll()
@@ -301,7 +322,7 @@ class XtreemFsDriverTestCase(test.TestCase):
         # Mock getting volume local path to return dummy value.
         self._mocker.StubOutWithMock(self._driver, "local_path")
         self._driver.local_path(volume).AndReturn(volume_path)
-        # Mock checking if path exist with a dummy value.
+        # Mock checking if path exist to return True for the dummy volume.
         self._mocker.StubOutWithMock(self._driver, "_path_exists")
         self._driver._path_exists(volume_path).AndReturn(True)
         # Mock removing local volume path to do nothing.
@@ -317,8 +338,32 @@ class XtreemFsDriverTestCase(test.TestCase):
         self._driver.delete_volume(volume)
         self._mocker.VerifyAll()
 
+    def test_delete_witout_location(self):
+        "deleting a volume without location should fail silently."
+        volume = _get_dummy_volume()
+        volume["provider_location"] = None
+
+        self._driver.delete_volume(volume)
+
     def test_delete_unexisting_volume(self):
         "deleting a volume that doesn't exist should fail silently."
+        volume = _get_dummy_volume()
+        volume_path = self._driver._get_mount_point_for_share(
+            volume["provider_location"]
+        )
+        # Mock getting volume loval path tp return dummy value.
+        self._mocker.StubOutWithMock(self._driver, "local_path")
+        self._driver.local_path(volume).AndReturn(volume_path)
+        # Mock checking if path exist to return False.
+        self._mocker.StubOutWithMock(self._driver, "_path_exists")
+        self._driver._path_exists(volume_path).AndReturn(False)
+        # Mock ensure share mounted to do nothing.
+        self._mocker.StubOutWithMock(self._driver, "_ensure_share_mounted")
+        self._driver._ensure_share_mounted(volume["provider_location"])
+
+        self._mocker.ReplayAll()
+        self._driver.delete_volume(volume)
+        self._mocker.VerifyAll()
 
     def test_mount_volume(self):
         "Test mounting a volume."
