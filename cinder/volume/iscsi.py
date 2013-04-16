@@ -190,7 +190,10 @@ class TgtAdm(TargetAdmin):
         else:
             raise exception.ISCSITargetRemoveFailed(volume_id=vol_id)
         try:
+            # NOTE(vish): --force is a workaround for bug:
+            #             https://bugs.launchpad.net/cinder/+bug/1159948
             self._execute('tgt-admin',
+                          '--force',
                           '--delete',
                           iqn,
                           run_as_root=True)
@@ -327,16 +330,16 @@ class FakeIscsiHelper(object):
 class LioAdm(TargetAdmin):
     """iSCSI target administration for LIO using python-rtslib."""
     def __init__(self, execute=utils.execute):
-        super(LioAdm, self).__init__('cinder-rtstool', execute)
+        super(LioAdm, self).__init__('rtstool', execute)
 
         try:
-            self._execute('cinder-rtstool', 'verify')
+            self._execute('rtstool', 'verify')
         except (OSError, exception.ProcessExecutionError):
-            LOG.error(_('cinder-rtstool is not installed correctly'))
+            LOG.error(_('rtstool is not installed correctly'))
             raise
 
     def _get_target(self, iqn):
-        (out, err) = self._execute('cinder-rtstool',
+        (out, err) = self._execute('rtstool',
                                    'get-targets',
                                    run_as_root=True)
         lines = out.split('\n')
@@ -354,7 +357,7 @@ class LioAdm(TargetAdmin):
 
         LOG.info(_('Creating iscsi_target for volume: %s') % vol_id)
 
-        # cinder-rtstool requires chap_auth, but unit tests don't provide it
+        # rtstool requires chap_auth, but unit tests don't provide it
         chap_auth_userid = 'test_id'
         chap_auth_password = 'test_pass'
 
@@ -366,7 +369,7 @@ class LioAdm(TargetAdmin):
             extra_args.append(FLAGS.lio_initiator_iqns)
 
         try:
-            command_args = ['cinder-rtstool',
+            command_args = ['rtstool',
                             'create',
                             path,
                             name,
@@ -397,7 +400,7 @@ class LioAdm(TargetAdmin):
         iqn = '%s%s' % (FLAGS.iscsi_target_prefix, vol_uuid_name)
 
         try:
-            self._execute('cinder-rtstool',
+            self._execute('rtstool',
                           'delete',
                           iqn,
                           run_as_root=True)
@@ -415,6 +418,25 @@ class LioAdm(TargetAdmin):
         tid = self._get_target(iqn)
         if tid is None:
             raise exception.NotFound()
+
+    def initialize_connection(self, volume, connector):
+        volume_iqn = volume['provider_location'].split(' ')[1]
+
+        (auth_method, auth_user, auth_pass) = \
+            volume['provider_auth'].split(' ', 3)
+
+        # Add initiator iqns to target ACL
+        try:
+            self._execute('rtstool', 'add-initiator',
+                          volume_iqn,
+                          auth_user,
+                          auth_pass,
+                          connector['initiator'],
+                          run_as_root=True)
+        except exception.ProcessExecutionError as e:
+            LOG.error(_("Failed to add initiator iqn %s to target") %
+                      connector['initiator'])
+            raise exception.ISCSITargetAttachFailed(volume_id=volume['id'])
 
 
 def get_target_admin():

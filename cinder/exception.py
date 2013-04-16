@@ -192,10 +192,6 @@ class InvalidVolume(Invalid):
     message = _("Invalid volume") + ": %(reason)s"
 
 
-class InvalidPortRange(Invalid):
-    message = _("Invalid port range %(from_port)s:%(to_port)s. %(msg)s")
-
-
 class InvalidContentType(Invalid):
     message = _("Invalid content type %(content_type)s.")
 
@@ -305,6 +301,10 @@ class ISCSITargetNotFoundForVolume(NotFound):
 
 class ISCSITargetCreateFailed(CinderException):
     message = _("Failed to create iscsi target for volume %(volume_id)s.")
+
+
+class ISCSITargetAttachFailed(CinderException):
+    message = _("Failed to attach iSCSI target for volume %(volume_id)s.")
 
 
 class ISCSITargetRemoveFailed(CinderException):
@@ -446,19 +446,32 @@ class QuotaError(CinderException):
 
 
 class VolumeSizeExceedsAvailableQuota(QuotaError):
-    message = _("Requested volume exceeds allowed volume size quota")
+    message = _("Requested volume or snapshot exceeds "
+                "allowed Gigabytes quota")
 
 
 class VolumeSizeExceedsQuota(QuotaError):
-    message = _("Maximum volume size exceeded")
+    message = _("Maximum volume/snapshot size exceeded")
 
 
 class VolumeLimitExceeded(QuotaError):
     message = _("Maximum number of volumes allowed (%(allowed)d) exceeded")
 
 
+class SnapshotLimitExceeded(QuotaError):
+    message = _("Maximum number of snapshots allowed (%(allowed)d) exceeded")
+
+
 class DuplicateSfVolumeNames(Duplicate):
     message = _("Detected more than one volume with name %(vol_name)s")
+
+
+class Duplicate3PARHost(CinderException):
+    message = _("3PAR Host already exists: %(err)s.  %(info)s")
+
+
+class Invalid3PARDomain(CinderException):
+    message = _("Invalid 3PAR Domain: %(err)s")
 
 
 class VolumeTypeCreateFailed(CinderException):

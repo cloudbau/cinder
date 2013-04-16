@@ -179,6 +179,7 @@ class VolumeController(wsgi.Controller):
         limit = params.pop('limit', None)
         sort_key = params.pop('sort_key', 'created_at')
         sort_dir = params.pop('sort_dir', 'desc')
+        params.pop('offset', None)
         filters = params
 
         remove_invalid_options(context,
@@ -220,7 +221,7 @@ class VolumeController(wsgi.Controller):
     def create(self, req, body):
         """Creates a new volume."""
         if not self.is_valid_body(body, 'volume'):
-            raise exc.HTTPUnprocessableEntity()
+            raise exc.HTTPBadRequest()
 
         context = req.environ['cinder.context']
         volume = body['volume']
@@ -240,7 +241,7 @@ class VolumeController(wsgi.Controller):
         req_volume_type = volume.get('volume_type', None)
         if req_volume_type:
             try:
-                kwargs['volume_type'] = volume_types.get_volume_type_by_name(
+                kwargs['volume_type'] = volume_types.get_volume_type(
                     context, req_volume_type)
             except exception.VolumeTypeNotFound:
                 explanation = 'Volume type not found.'
@@ -274,9 +275,6 @@ class VolumeController(wsgi.Controller):
         image_uuid = None
         if self.ext_mgr.is_loaded('os-image-create'):
             image_href = volume.get('imageRef')
-            if snapshot_id and image_href:
-                msg = _("Snapshot and image cannot be specified together.")
-                raise exc.HTTPBadRequest(explanation=msg)
             if image_href:
                 image_uuid = self._image_uuid_from_href(image_href)
                 kwargs['image_id'] = image_uuid
@@ -306,10 +304,10 @@ class VolumeController(wsgi.Controller):
         context = req.environ['cinder.context']
 
         if not body:
-            raise exc.HTTPUnprocessableEntity()
+            raise exc.HTTPBadRequest()
 
         if 'volume' not in body:
-            raise exc.HTTPUnprocessableEntity()
+            raise exc.HTTPBadRequest()
 
         volume = body['volume']
         update_dict = {}

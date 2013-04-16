@@ -69,8 +69,8 @@ volume_manager_opts = [
                help='Driver to use for volume creation'),
 ]
 
-FLAGS = flags.FLAGS
-FLAGS.register_opts(volume_manager_opts)
+CONF = cfg.CONF
+CONF.register_opts(volume_manager_opts)
 
 MAPPING = {
     'cinder.volume.driver.RBDDriver': 'cinder.volume.drivers.rbd.RBDDriver',
@@ -260,6 +260,7 @@ class VolumeManager(manager.SchedulerDependentManager):
                                             snapshot_id, image_id,
                                             request_spec, filter_properties,
                                             allow_reschedule)
+                return
 
             if model_update:
                 volume_ref = self.db.volume_update(
@@ -332,7 +333,7 @@ class VolumeManager(manager.SchedulerDependentManager):
         rescheduled = False
 
         try:
-            method_args = (FLAGS.volume_topic, volume_id, snapshot_id,
+            method_args = (CONF.volume_topic, volume_id, snapshot_id,
                            image_id, request_spec, filter_properties)
 
             rescheduled = self._reschedule(context, request_spec,
@@ -343,7 +344,8 @@ class VolumeManager(manager.SchedulerDependentManager):
 
         except Exception:
             rescheduled = False
-            LOG.exception(_("Error trying to reschedule"))
+            LOG.exception(_("volume %s: Error trying to reschedule create"),
+                          volume_id)
 
         if rescheduled:
             # log the original build error
@@ -360,20 +362,20 @@ class VolumeManager(manager.SchedulerDependentManager):
         retry = filter_properties.get('retry', None)
         if not retry:
             # no retry information, do not reschedule.
-            LOG.debug(_("Retry info not present, will not reschedule"),
-                      volume_id=volume_id)
+            LOG.debug(_("Retry info not present, will not reschedule"))
             return
 
         if not request_spec:
-            LOG.debug(_("No request spec, will not reschedule"),
-                      volume_id=volume_id)
+            LOG.debug(_("No request spec, will not reschedule"))
             return
 
-        request_spec['volume_id'] = [volume_id]
+        request_spec['volume_id'] = volume_id
 
-        LOG.debug(_("Re-scheduling %(method)s: attempt %(num)d") %
-                  {'method': scheduler_method.func_name,
-                   'num': retry['num_attempts']}, volume_id=volume_id)
+        LOG.debug(_("volume %(volume_id)s: re-scheduling %(method)s "
+                    "attempt %(num)d") %
+                  {'volume_id': volume_id,
+                   'method': scheduler_method.func_name,
+                   'num': retry['num_attempts']})
 
         # reset the volume state:
         now = timeutils.utcnow()
@@ -392,6 +394,12 @@ class VolumeManager(manager.SchedulerDependentManager):
         """Deletes and unexports volume."""
         context = context.elevated()
         volume_ref = self.db.volume_get(context, volume_id)
+
+        if context.project_id != volume_ref['project_id']:
+            project_id = volume_ref['project_id']
+        else:
+            project_id = context.project_id
+
         LOG.info(_("volume %s: deleting"), volume_ref['name'])
         if volume_ref['attach_status'] == "attached":
             # Volume is still attached, need to detach first
@@ -421,7 +429,9 @@ class VolumeManager(manager.SchedulerDependentManager):
 
         # Get reservations
         try:
-            reservations = QUOTAS.reserve(context, volumes=-1,
+            reservations = QUOTAS.reserve(context,
+                                          project_id=project_id,
+                                          volumes=-1,
                                           gigabytes=-volume_ref['size'])
         except Exception:
             reservations = None
@@ -434,7 +444,7 @@ class VolumeManager(manager.SchedulerDependentManager):
 
         # Commit the reservations
         if reservations:
-            QUOTAS.commit(context, reservations)
+            QUOTAS.commit(context, reservations, project_id=project_id)
 
         return True
 
@@ -443,6 +453,8 @@ class VolumeManager(manager.SchedulerDependentManager):
         context = context.elevated()
         snapshot_ref = self.db.snapshot_get(context, snapshot_id)
         LOG.info(_("snapshot %s: creating"), snapshot_ref['name'])
+        self._notify_about_snapshot_usage(
+            context, snapshot_ref, "create.start")
 
         try:
             snap_name = snapshot_ref['name']
@@ -465,6 +477,7 @@ class VolumeManager(manager.SchedulerDependentManager):
                                                         snapshot_ref['id'],
                                                         volume_id)
         LOG.info(_("snapshot %s: created successfully"), snapshot_ref['name'])
+        self._notify_about_snapshot_usage(context, snapshot_ref, "create.end")
         return snapshot_id
 
     def delete_snapshot(self, context, snapshot_id):
@@ -472,6 +485,13 @@ class VolumeManager(manager.SchedulerDependentManager):
         context = context.elevated()
         snapshot_ref = self.db.snapshot_get(context, snapshot_id)
         LOG.info(_("snapshot %s: deleting"), snapshot_ref['name'])
+        self._notify_about_snapshot_usage(
+            context, snapshot_ref, "delete.start")
+
+        if context.project_id != snapshot_ref['project_id']:
+            project_id = snapshot_ref['project_id']
+        else:
+            project_id = context.project_id
 
         try:
             LOG.debug(_("snapshot %s: deleting"), snapshot_ref['name'])
@@ -488,9 +508,29 @@ class VolumeManager(manager.SchedulerDependentManager):
                                         snapshot_ref['id'],
                                         {'status': 'error_deleting'})
 
+        # Get reservations
+        try:
+            if CONF.no_snapshot_gb_quota:
+                reservations = QUOTAS.reserve(context,
+                                              project_id=project_id,
+                                              snapshots=-1)
+            else:
+                reservations = QUOTAS.reserve(
+                    context,
+                    project_id=project_id,
+                    snapshots=-1,
+                    gigabytes=-snapshot_ref['volume_size'])
+        except Exception:
+            reservations = None
+            LOG.exception(_("Failed to update usages deleting snapshot"))
         self.db.volume_glance_metadata_delete_by_snapshot(context, snapshot_id)
         self.db.snapshot_destroy(context, snapshot_id)
         LOG.info(_("snapshot %s: deleted successfully"), snapshot_ref['name'])
+        self._notify_about_snapshot_usage(context, snapshot_ref, "delete.end")
+
+        # Commit the reservations
+        if reservations:
+            QUOTAS.commit(context, reservations, project_id=project_id)
         return True
 
     def attach_volume(self, context, volume_id, instance_uuid, mountpoint):
@@ -668,4 +708,13 @@ class VolumeManager(manager.SchedulerDependentManager):
                                    extra_usage_info=None):
         volume_utils.notify_about_volume_usage(
             context, volume, event_suffix,
+            extra_usage_info=extra_usage_info, host=self.host)
+
+    def _notify_about_snapshot_usage(self,
+                                     context,
+                                     snapshot,
+                                     event_suffix,
+                                     extra_usage_info=None):
+        volume_utils.notify_about_snapshot_usage(
+            context, snapshot, event_suffix,
             extra_usage_info=extra_usage_info, host=self.host)

@@ -45,7 +45,7 @@ weights = [
 
 setuptools.setup(
     name=project,
-    version=common_setup.get_version(project, '2013.1'),
+    version=common_setup.get_version(project, '2013.2'),
     description='block storage service',
     author='OpenStack',
     author_email='cinder@lists.launchpad.net',
@@ -77,7 +77,6 @@ setuptools.setup(
              'bin/cinder-clear-rabbit-queues',
              'bin/cinder-manage',
              'bin/cinder-rootwrap',
-             'bin/cinder-rtstool',
              'bin/cinder-scheduler',
              'bin/cinder-volume',
              'bin/cinder-volume-usage-audit'],

@@ -26,7 +26,6 @@ from oslo.config import cfg
 from xml.etree import ElementTree as ET
 
 from cinder import exception
-from cinder import flags
 from cinder.openstack.common import excutils
 from cinder.openstack.common import log as logging
 from cinder import utils
@@ -39,13 +38,10 @@ huawei_opt = [
                default='/etc/cinder/cinder_huawei_conf.xml',
                help='config data for cinder huawei plugin')]
 
-FLAGS = flags.FLAGS
-FLAGS.register_opts(huawei_opt)
-
 HOST_GROUP_NAME = 'HostGroup_OpenStack'
 HOST_NAME_PREFIX = 'Host_'
 HOST_PORT_PREFIX = 'HostPort_'
-VOL_AND_SNAP_NAME_FREFIX = 'OpenStack_'
+VOL_AND_SNAP_NAME_PREFIX = 'OpenStack_'
 READBUFFERSIZE = 8192
 
 
@@ -107,6 +103,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
 
     def __init__(self, *args, **kwargs):
         super(HuaweiISCSIDriver, self).__init__(*args, **kwargs)
+        self.configuration.append_config_values(huawei_opt)
         self.device_type = {}
         self.login_info = {}
         self.hostgroup_id = None
@@ -120,13 +117,6 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         LOG.debug(_('do_setup.'))
 
         self._check_conf_file()
-        # Create hostgroup.
-        self.login_info = self._get_login_info()
-        hostgroup_name = HOST_GROUP_NAME
-        self.hostgroup_id = self._find_hostgroup(hostgroup_name)
-        if not self.hostgroup_id:
-            self._create_hostgroup(hostgroup_name)
-            self.hostgroup_id = self._find_hostgroup(hostgroup_name)
 
     def check_for_setup_error(self):
         """Try to connect with device and get device type."""
@@ -151,6 +141,17 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             LOG.error(err_msg)
             raise exception.VolumeBackendAPIException(data=err_msg)
 
+        # Check whether storage pools are configured.
+        # Dorado2100 G2 needn't to configure this.
+        if self.device_type['type'] != 'Dorado2100 G2':
+            root = self._read_xml()
+            pool_node = root.findall('LUN/StoragePool')
+            if not pool_node:
+                err_msg = (_('_get_device_type: Storage Pool must be'
+                             'configured.'))
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
+
     def create_volume(self, volume):
         """Create a new volume."""
         volume_name = self._name_translate(volume['name'])
@@ -159,11 +160,11 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
 
         self.login_info = self._get_login_info()
         if int(volume['size']) == 0:
-            volume_sise = '100M'
+            volume_size = '100M'
         else:
-            volume_sise = '%sG' % volume['size']
+            volume_size = '%sG' % volume['size']
 
-        self._create_volume(volume_name, volume_sise)
+        self._create_volume(volume_name, volume_size)
 
     def delete_volume(self, volume):
         """Delete a volume."""
@@ -173,7 +174,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
 
         self.login_info = self._get_login_info()
         volume_id = self._find_lun(volume_name)
-        if volume_id:
+        if volume_id is not None:
             self._delete_volume(volume_name, volume_id)
         else:
             err_msg = (_('delete_volume:No need to delete volume.'
@@ -188,7 +189,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         LOG.debug(_('create_export: volume name:%s') % volume['name'])
 
         lun_id = self._find_lun(volume_name)
-        if not lun_id:
+        if lun_id is None:
             err_msg = (_('create_export:Volume %(name)s does not exist.')
                        % {'name': volume_name})
             LOG.error(err_msg)
@@ -214,9 +215,42 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                   % {'volume': volume_name,
                      'ini': initiator_name})
 
+        self.login_info = self._get_login_info()
+        # Get target iSCSI iqn.
+        iscsi_conf = self._get_iscsi_info()
+        target_ip = None
+        for ini in iscsi_conf['Initiator']:
+            if ini['Name'] == initiator_name:
+                target_ip = ini['TargetIP']
+                break
+        if not target_ip:
+            if not iscsi_conf['DefaultTargetIP']:
+                err_msg = (_('initialize_connection:Failed to find target ip'
+                             'for initiator:%(initiatorname)s,'
+                             'please check config file.')
+                           % {'initiatorname': initiator_name})
+                LOG.error(err_msg)
+                raise exception.VolumeBackendAPIException(data=err_msg)
+            target_ip = iscsi_conf['DefaultTargetIP']
+
+        target_iqn = self._get_tgt_iqn(target_ip)
+        if not target_iqn:
+            err_msg = (_('initialize_connection:Failed to find target iSCSI'
+                         'iqn. Target IP:%(ip)s')
+                       % {'ip': target_ip})
+            LOG.error(err_msg)
+            raise exception.VolumeBackendAPIException(data=err_msg)
+
+        # Create hostgroup and host.
+        hostgroup_name = HOST_GROUP_NAME
+        self.hostgroup_id = self._find_hostgroup(hostgroup_name)
+        if self.hostgroup_id is None:
+            self._create_hostgroup(hostgroup_name)
+            self.hostgroup_id = self._find_hostgroup(hostgroup_name)
+
         host_name = HOST_NAME_PREFIX + str(hash(initiator_name))
         host_id = self._find_host_in_hostgroup(host_name, self.hostgroup_id)
-        if not host_id:
+        if host_id is None:
             self._add_host(host_name, self.hostgroup_id)
             host_id = self._find_host_in_hostgroup(host_name,
                                                    self.hostgroup_id)
@@ -246,26 +280,9 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                      'ini': initiator_name,
                      'port': port_name})
 
-        # Get target iSCSI iqn.
-        iscsi_conf = self._get_iscsi_info()
-        target_ip = None
-        for ini in iscsi_conf['Initiator']:
-            if ini['Name'] == initiator_name:
-                target_ip = ini['TargetIP']
-                break
-        if not target_ip:
-            target_ip = iscsi_conf['DefaultTargetIP']
-
-        target_iqn = self._get_tgt_iqn(target_ip)
-        if not target_iqn:
-            err_msg = (_('initialize_connection:'
-                         'Failed to find target iSCSI iqn.'))
-            LOG.error(err_msg)
-            raise exception.VolumeBackendAPIException(data=err_msg)
-
         # Map a LUN to a host if not mapped.
         lun_id = self._find_lun(volume_name)
-        if not lun_id:
+        if lun_id is None:
             err_msg = (_('initialize_connection:Failed to find the '
                          'given volume. '
                          'volume name:%(volume)s.')
@@ -274,14 +291,22 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
 
         hostlun_id = None
         map_info = self._get_map_info(host_id)
+        # Make sure the hostLUN ID starts from 1.
+        new_hostlun_id = 1
+        new_hostlunid_found = False
         if map_info:
             for map in map_info:
                 if map['devlunid'] == lun_id:
                     hostlun_id = map['hostlunid']
                     break
+                elif not new_hostlunid_found:
+                    if new_hostlun_id < int(map['hostlunid']):
+                        new_hostlunid_found = True
+                    else:
+                        new_hostlun_id = int(map['hostlunid']) + 1
         # The LUN is not mapped to the host.
         if not hostlun_id:
-            self._map_lun(lun_id, host_id)
+            self._map_lun(lun_id, host_id, new_hostlun_id)
             hostlun_id = self._get_hostlunid(host_id, lun_id)
 
         # Return iSCSI properties.
@@ -314,7 +339,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         self.login_info = self._get_login_info()
         host_name = HOST_NAME_PREFIX + str(hash(initiator_name))
         host_id = self._find_host_in_hostgroup(host_name, self.hostgroup_id)
-        if not host_id:
+        if host_id is None:
             err_msg = (_('terminate_connection:Host does not exist. '
                          'Host name:%(host)s.')
                        % {'host': host_name})
@@ -323,7 +348,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
 
         # Delete host map.
         lun_id = self._find_lun(volume_name)
-        if not lun_id:
+        if lun_id is None:
             err_msg = (_('terminate_connection:volume does not exist.'
                          'volume name:%(volume)s')
                        % {'volume': volume_name})
@@ -339,7 +364,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                 if map['devlunid'] == lun_id:
                     map_id = map['mapid']
                     break
-        if map_id:
+        if map_id is not None:
             self._delete_map(map_id)
             mapnum = mapnum - 1
         else:
@@ -382,11 +407,18 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         self.login_info = self._get_login_info()
         if self.device_type['type'] == 'Dorado2100 G2':
             err_msg = (_('create_snapshot:Device does not support snapshot.'))
+
+            LOG.error(err_msg)
+            raise exception.VolumeBackendAPIException(data=err_msg)
+
+        if self._is_resource_pool_enough() is False:
+            err_msg = (_('create_snapshot:'
+                         'Resource pool needs 1GB valid size at least.'))
             LOG.error(err_msg)
             raise exception.VolumeBackendAPIException(data=err_msg)
 
         lun_id = self._find_lun(volume_name)
-        if not lun_id:
+        if lun_id is None:
             err_msg = (_('create_snapshot:Volume does not exist.'
                          'Volume name:%(name)s')
                        % {'name': volume_name})
@@ -420,7 +452,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             raise exception.VolumeBackendAPIException(data=err_msg)
 
         snapshot_id = self._find_snapshot(snapshot_name)
-        if snapshot_id:
+        if snapshot_id is not None:
             self._disable_snapshot(snapshot_id)
             self._delete_snapshot(snapshot_id)
         else:
@@ -455,7 +487,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             raise exception.VolumeBackendAPIException(data=err_msg)
 
         snapshot_id = self._find_snapshot(snapshot_name)
-        if not snapshot_id:
+        if snapshot_id is None:
             err_msg = (_('create_volume_from_snapshot:Snapshot does not exist.'
                          'Snapshot name:%(name)s')
                        % {'name': snapshot_name})
@@ -502,22 +534,13 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             IP2 = root.findtext('Storage/ControllerIP1')
             username = root.findtext('Storage/UserName')
             pwd = root.findtext('Storage/UserPassword')
-            pool = root.findall('LUN/StoragePool')
 
             isconfwrong = False
             if ((not IP1 and not IP2) or
                     (not username) or
-                    (not pwd) or
-                    (not pool)):
-                isconfwrong = True
-
-            elif not pool[0].attrib['Name']:
-                isconfwrong = True
-
-            if isconfwrong is True:
-                err_msg = (_('Config file is wrong. '
-                             'Controler IP, UserName, UserPassword and '
-                             'StoragePool must be set.'))
+                    (not pwd)):
+                err_msg = (_('Config file is wrong. Controler IP, '
+                             'UserName and UserPassword must be set.'))
                 LOG.error(err_msg)
                 raise exception.InvalidInput(reason=err_msg)
 
@@ -527,7 +550,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
 
     def _read_xml(self):
         """Open xml file."""
-        filename = FLAGS.cinder_huawei_conf_file
+        filename = self.configuration.cinder_huawei_conf_file
         try:
             tree = ET.parse(filename)
             root = tree.getroot()
@@ -548,7 +571,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             logininfo['UserPassword'] = root.findtext('Storage/UserPassword')
 
         except Exception as err:
-            LOG.debug(_('_get_login_info error. %s') % err)
+            LOG.error(_('_get_login_info error. %s') % err)
             raise exception.VolumeBackendAPIException(data=err)
         return logininfo
 
@@ -569,7 +592,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             luntype = root.findtext('LUN/LUNType')
             if luntype in ['Thick', 'Thin']:
                 lunsetinfo['LUNType'] = luntype
-            elif luntype is not '' or luntype is not None:
+            elif luntype:
                 err_msg = (_('Config file is wrong. LUNType must be "Thin"'
                              ' or "Thick". LUNType:%(type)s')
                            % {'type': luntype})
@@ -578,20 +601,19 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             # Here we do not judge whether the parameters are right.
             # CLI will return error responses if the parameters not right.
             stripunitsize = root.findtext('LUN/StripUnitSize')
-            if stripunitsize is not '' and stripunitsize is not None:
+            if stripunitsize:
                 lunsetinfo['StripUnitSize'] = stripunitsize
             writetype = root.findtext('LUN/WriteType')
-            if writetype is not '' and writetype is not None:
+            if writetype:
                 lunsetinfo['WriteType'] = writetype
             mirrorswitch = root.findtext('LUN/MirrorSwitch')
-            if mirrorswitch is not '' and mirrorswitch is not None:
+            if mirrorswitch:
                 lunsetinfo['MirrorSwitch'] = mirrorswitch
 
             if self.device_type['type'] == 'Tseries':
-                pooltype = luntype
+                pooltype = lunsetinfo['LUNType']
                 prefetch = root.find('LUN/Prefetch')
-                if ((prefetch is not None) and
-                        (prefetch.attrib['Type'] != '')):
+                if prefetch and prefetch.attrib['Type']:
                     lunsetinfo['PrefetchType'] = prefetch.attrib['Type']
                     if lunsetinfo['PrefetchType'] == '1':
                         lunsetinfo['PrefetchValue'] = prefetch.attrib['Value']
@@ -666,7 +688,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                         maxpoolid = pooldetail[0]
                         maxpoolsize = int(float(pooldetail[sizeindex]))
                     break
-        if maxpoolid:
+        if maxpoolid is not None:
             return maxpoolid
         else:
             err_msg = (_('_get_maximum_pool:maxpoolid is None.'
@@ -739,7 +761,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
 
     def _name_translate(self, name):
         """Form new names because of the 32-character limit on names."""
-        newname = VOL_AND_SNAP_NAME_FREFIX + str(hash(name))
+        newname = VOL_AND_SNAP_NAME_PREFIX + str(hash(name))
 
         LOG.debug(_('_name_translate:Name in cinder: %(old)s, '
                     'new name in storage system: %(new)s')
@@ -764,7 +786,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             d = 0
 
         for i in range(6, len(en) - 2):
-            r = en[i].split()
+            r = en[i].replace('Not format', 'Notformat').split()
             if r[6 - d] == name:
                 return r[0]
         return None
@@ -860,7 +882,6 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         if len(en) < 6:
             return None
 
-        en = out.split('\r\n')
         for i in range(6, len(en) - 2):
             r = en[i].split()
             if r[1] == hostname:
@@ -879,7 +900,6 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         hostportinfo = []
         list_key = ['id', 'name', 'info', 'type', 'hostid',
                     'linkstatus', 'multioathtype']
-        en = out.split('\r\n')
         for i in range(6, len(en) - 2):
             list_val = en[i].split()
             hostport_dic = dict(map(None, list_key, list_val))
@@ -979,19 +999,26 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                 return iscsiIPinfo
         return None
 
-    def _map_lun(self, lunid, hostid):
-        """Map a lun to a host."""
-        cli_cmd = ('addhostmap -host %(hostid)s -devlun %(lunid)s'
+    def _map_lun(self, lunid, hostid, new_hostlun_id):
+        """Map a lun to a host.
+
+        Here we give the hostlun ID which starts from 1.
+        """
+        cli_cmd = ('addhostmap -host %(hostid)s -devlun %(lunid)s '
+                   '-hostlun %(hostlunid)s'
                    % {'hostid': hostid,
-                      'lunid': lunid})
+                      'lunid': lunid,
+                      'hostlunid': new_hostlun_id})
         out = self._execute_cli(cli_cmd)
         if not re.search('command operates successfully', out):
             err_msg = (_('_map_lun:Failed to add hostmap.'
                          'hostid:%(host)s'
-                         'lunid:%(lun)s.'
+                         'lunid:%(lun)s'
+                         'hostlunid:%(hostlunid)s.'
                          'out:%(out)s')
                        % {'host': hostid,
                           'lun': lunid,
+                          'hostlunid': new_hostlun_id,
                           'out': out})
             LOG.error(err_msg)
             raise exception.VolumeBackendAPIException(data=err_msg)
@@ -1040,7 +1067,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                    % {'hostid': hostid})
         out = self._execute_cli(cli_cmd)
         if not re.search('command operates successfully', out):
-            err_msg = (_('Error: Failed delete host,host id: %(hostid)s.'
+            err_msg = (_('_delete_host: Failed delete host.host id:%(hostid)s.'
                          'out:%(out)s')
                        % {'hostid': hostid,
                           'out': out})
@@ -1048,7 +1075,13 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             raise exception.VolumeBackendAPIException(data=err_msg)
 
     def _get_map_info(self, hostid):
-        """Get map infomation of the given host."""
+        """Get map infomation of the given host.
+
+        This method return a map information list. Every item in the list
+        is a dictionary. The dictionarie includes three keys: mapid,
+        devlunid, hostlunid. These items are sorted by hostlunid value
+        from small to large.
+        """
         cli_cmd = ('showhostmap -host %(hostid)s'
                    % {'hostid': hostid})
         out = self._execute_cli(cli_cmd)
@@ -1059,12 +1092,23 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         mapinfo = []
         list_tmp = []
         list_key = ['mapid', 'devlunid', 'hostlunid']
-        en = out.split('\r\n')
         for i in range(6, len(en) - 2):
             list_tmp = en[i].split()
             list_val = [list_tmp[0], list_tmp[2], list_tmp[4]]
             dic = dict(map(None, list_key, list_val))
-            mapinfo.append(dic)
+            inserted = False
+            mapinfo_length = len(mapinfo)
+            if mapinfo_length == 0:
+                mapinfo.append(dic)
+                continue
+            for index in range(0, mapinfo_length):
+                if (int(mapinfo[mapinfo_length - index - 1]['hostlunid']) <
+                        int(dic['hostlunid'])):
+                    mapinfo.insert(mapinfo_length - index, dic)
+                    inserted = True
+                    break
+            if not inserted:
+                mapinfo.insert(0, dic)
         return mapinfo
 
     def _get_device_type(self):
@@ -1332,6 +1376,28 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                 return r[1]
         return None
 
+    def _is_resource_pool_enough(self):
+        """Check whether resource pools' valid size is more than 1G."""
+        cli_cmd = ('showrespool')
+        out = self._execute_cli(cli_cmd)
+        en = re.split('\r\n', out)
+        if len(en) <= 6:
+            LOG.error(_('_is_resource_pool_enough:Resource pool for snapshot'
+                        'not be added.'))
+            return False
+        resource_pools = []
+        list_key = ['pool id', 'size', 'usage', 'valid size',
+                    'alarm threshold']
+        for i in range(6, len(en) - 2):
+            list_val = en[i].split()
+            dic = dict(map(None, list_key, list_val))
+            resource_pools.append(dic)
+
+        for pool in resource_pools:
+            if float(pool['valid size']) < 1024.0:
+                return False
+        return True
+
     def _update_volume_status(self):
         """Retrieve status info from volume group."""
 
@@ -1351,14 +1417,12 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
     def _get_free_capacity(self):
         """Get total free capacity of pools."""
         self.login_info = self._get_login_info()
-        self.device_type = self._get_device_type()
-
         root = self._read_xml()
         lun_type = root.findtext('LUN/LUNType')
-        if (self.device_type['type'] == 'Dorado5100' or not lun_type):
-            lun_type = 'Thick'
-        elif self.device_type['type'] == 'Dorado2100 G2':
+        if self.device_type['type'] == 'Dorado2100 G2':
             lun_type = 'Thin'
+        elif (self.device_type['type'] == 'Dorado5100' or not lun_type):
+            lun_type = 'Thick'
         poolinfo_dev = self._find_pool_info(lun_type)
         pools_conf = root.findall('LUN/StoragePool')
         total_free_capacity = 0

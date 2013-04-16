@@ -32,11 +32,14 @@ import sys
 
 from oslo.config import cfg
 
+from cinder import version
+
 FLAGS = cfg.CONF
 
 
 def parse_args(argv, default_config_files=None):
     FLAGS(argv[1:], project='cinder',
+          version=version.version_string(),
           default_config_files=default_config_files)
 
 
@@ -78,7 +81,8 @@ core_opts = [
     cfg.StrOpt('sql_connection',
                default='sqlite:///$state_path/$sqlite_db',
                help='The SQLAlchemy connection string used to connect to the '
-                    'database'),
+                    'database',
+               secret=True),
     cfg.IntOpt('sql_connection_debug',
                default=0,
                help='Verbosity of SQL debugging information. 0=None, '
@@ -117,6 +121,9 @@ global_opts = [
                 default=['$glance_host:$glance_port'],
                 help='A list of the glance api servers available to cinder '
                      '([hostname|ip]:port)'),
+    cfg.IntOpt('glance_api_version',
+               default=1,
+               help='Version of the glance api to use'),
     cfg.IntOpt('glance_num_retries',
                default=0,
                help='Number retries when downloading an image from glance'),
@@ -228,13 +235,13 @@ global_opts = [
                default='noauth',
                help='The strategy to use for auth. Supports noauth, keystone, '
                     'and deprecated.'),
-    cfg.StrOpt('control_exchange',
-               default='cinder',
-               help='AMQP exchange to connect to if using RabbitMQ or Qpid'),
     cfg.ListOpt('enabled_backends',
                 default=None,
                 help='A list of backend names to use. These backend names '
                      'should be backed by a unique [CONFIG] group '
-                     'with its options'), ]
+                     'with its options'),
+    cfg.BoolOpt('no_snapshot_gb_quota',
+                default=False,
+                help='Whether snapshots count against GigaByte quota'), ]
 
 FLAGS.register_opts(global_opts)

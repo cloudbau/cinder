@@ -23,6 +23,7 @@ from xml.etree import ElementTree as ET
 from cinder import exception
 from cinder.openstack.common import log as logging
 from cinder import test
+from cinder.volume import configuration as conf
 from cinder.volume.drivers.huawei import huawei_iscsi
 
 LOG = logging.getLogger(__name__)
@@ -184,7 +185,7 @@ class HuaweiVolumeTestCase(test.TestCase):
 
     def __init__(self, *args, **kwargs):
         super(HuaweiVolumeTestCase, self).__init__(*args, **kwargs)
-        self.driver = FakeHuaweiStorage()
+        self.driver = FakeHuaweiStorage(configuration=conf.Configuration(None))
         self.driver.do_setup({})
         self.driver._test_flg = 'check_for_fail'
         self._test_check_for_setup_errors()
@@ -792,6 +793,18 @@ Link Status  Multipath Type
 """ % (FakePoolInfo['ID'], FakePoolInfo['Level'],
        FakePoolInfo['Status'], FakePoolInfo['Free Capacity'],
        FakePoolInfo['Disk List'], FakePoolInfo['Name'])
+
+        elif cmd == 'showrespool':
+            out = """/>showrespool
+============================================================================
+                         Resource Pool Information
+----------------------------------------------------------------------------
+  Pool ID    Size(MB)    Usage(MB)    Valid Size(MB)    Alarm Threshold(%)
+----------------------------------------------------------------------------
+  A          5130.0      0.0          5130.0            80
+  B          3082.0      0.0          3082.0            80
+============================================================================
+"""
 
         out = out.replace('\n', '\r\n')
         return out

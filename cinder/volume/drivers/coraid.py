@@ -18,6 +18,7 @@
 Desc    : Driver to store volumes on Coraid Appliances.
 Require : Coraid EtherCloud ESM, Coraid VSX and Coraid SRX.
 Author  : Jean-Baptiste RANSY <openstack@alyseo.com>
+Contrib : Larry Matter <support@coraid.com>
 """
 
 import cookielib
@@ -45,6 +46,10 @@ coraid_opts = [
     cfg.StrOpt('coraid_user',
                default='admin',
                help='User name to connect to Coraid ESM'),
+    cfg.StrOpt('coraid_group',
+               default='admin',
+               help='Name of group on Coraid ESM to which coraid_user belongs'
+               ' (must have admin privilege)'),
     cfg.StrOpt('coraid_password',
                default='password',
                help='Password to connect to Coraid ESM'),
@@ -74,16 +79,16 @@ class CoraidESMException(CoraidException):
 class CoraidRESTClient(object):
     """Executes volume driver commands on Coraid ESM EtherCloud Appliance."""
 
-    def __init__(self, ipaddress, user, password):
+    def __init__(self, ipaddress, user, group, password):
         self.url = "https://%s:8443/" % ipaddress
         self.user = user
+        self.group = group
         self.password = password
         self.session = False
         self.cookiejar = cookielib.CookieJar()
         self.urlOpener = urllib2.build_opener(
             urllib2.HTTPCookieProcessor(self.cookiejar))
         LOG.debug(_('Running with CoraidDriver for ESM EtherCLoud'))
-        self._login()
 
     def _login(self):
         """Login and Session Handler."""
@@ -91,22 +96,58 @@ class CoraidRESTClient(object):
             url = ('admin?op=login&username=%s&password=%s' %
                    (self.user, self.password))
             data = 'Login'
-            reply = self._esm(url, data)
+            reply = self._admin_esm_cmd(url, data)
             if reply.get('state') == 'adminSucceed':
                 self.session = time.time() + 1100
                 msg = _('Update session cookie %(session)s')
                 LOG.debug(msg % dict(session=self.session))
+                self._set_group(reply)
                 return True
             else:
-                errmsg = response.get('message', '')
+                errmsg = reply.get('message', '')
                 msg = _('Message : %(message)s')
                 raise CoraidESMException(msg % dict(message=errmsg))
         return True
 
-    def _esm(self, url=False, data=None):
+    def _set_group(self, reply):
+        """Set effective group."""
+        if self.group:
+            group = self.group
+            groupId = self._get_group_id(group, reply)
+            if groupId:
+                url = ('admin?op=setRbacGroup&groupId=%s' % (groupId))
+                data = 'Group'
+                reply = self._admin_esm_cmd(url, data)
+                if reply.get('state') == 'adminSucceed':
+                    return True
+                else:
+                    errmsg = reply.get('message', '')
+                    msg = _('Error while trying to set group: %(message)s')
+                    raise CoraidRESTException(msg % dict(message=errmsg))
+            else:
+                msg = _('Unable to find group: %(group)s')
+                raise CoraidESMException(msg % dict(group=group))
+        return True
+
+    def _get_group_id(self, groupName, loginResult):
+        """Map group name to group ID."""
+        # NOTE(lmatter): All other groups are under the admin group
+        fullName = "admin group:%s" % groupName
+        groupId = False
+        for kid in loginResult['values']:
+            fullPath = kid['fullPath']
+            if fullPath == fullName:
+                return kid['groupId']
+        return False
+
+    def _esm_cmd(self, url=False, data=None):
+        self._login()
+        return self._admin_esm_cmd(url, data)
+
+    def _admin_esm_cmd(self, url=False, data=None):
         """
-        _esm represent the entry point to send requests to ESM Appliance.
-        Send the HTTPS call, get response in JSON
+        _admin_esm_cmd represent the entry point to send requests to ESM
+        Appliance.  Send the HTTPS call, get response in JSON
         convert response into Python Object and return it.
         """
         if url:
@@ -130,10 +171,9 @@ class CoraidRESTClient(object):
 
     def _configure(self, data):
         """In charge of all commands into 'configure'."""
-        self._login()
         url = 'configure'
         LOG.debug(_('Configure data : %s'), data)
-        response = self._esm(url, data)
+        response = self._esm_cmd(url, data)
         LOG.debug(_("Configure response : %s"), response)
         if response:
             if response.get('configState') == 'completedSuccessfully':
@@ -144,31 +184,19 @@ class CoraidRESTClient(object):
                 raise CoraidESMException(msg % dict(message=errmsg))
         return False
 
-    def _get_volume_info(self, lvname):
-        """Fetch information for a given Volume or Snapshot."""
-        self._login()
-        url = 'fetch?shelf=cms&orchStrRepo&lv=%s' % (lvname)
-        response = self._esm(url)
-
-        items = []
-        for cmd, reply in response:
-            if len(reply['reply']) != 0:
-                items.append(reply['reply'])
-
-        volume_info = False
-        for item in items[0]:
-            if item['lv']['name'] == lvname:
-                volume_info = {
-                    "pool": item['lv']['containingPool'],
-                    "repo": item['repoName'],
-                    "vsxidx": item['lv']['lunIndex'],
-                    "index": item['lv']['lvStatus']['exportedLun']['lun'],
-                    "shelf": item['lv']['lvStatus']['exportedLun']['shelf']}
-
-        if volume_info:
-            return volume_info
-        else:
-            msg = _('Informtion about Volume %(volname)s not found')
+    def _get_volume_info(self, volume_name):
+        """Retrive volume informations for a given volume name."""
+        url = 'fetch?shelf=cms&orchStrRepo&lv=%s' % (volume_name)
+        try:
+            response = self._esm_cmd(url)
+            info = response[0][1]['reply'][0]
+            return {"pool": info['lv']['containingPool'],
+                    "repo": info['repoName'],
+                    "vsxidx": info['lv']['lunIndex'],
+                    "index": info['lv']['lvStatus']['exportedLun']['lun'],
+                    "shelf": info['lv']['lvStatus']['exportedLun']['shelf']}
+        except Exception:
+            msg = _('Unable to retrive volume infos for volume %(volname)s')
             raise CoraidESMException(msg % dict(volname=volume_name))
 
     def _get_lun_address(self, volume_name):
@@ -252,6 +280,7 @@ class CoraidDriver(driver.VolumeDriver):
         """Initialize the volume driver."""
         self.esm = CoraidRESTClient(self.configuration.coraid_esm_address,
                                     self.configuration.coraid_user,
+                                    self.configuration.coraid_group,
                                     self.configuration.coraid_password)
 
     def check_for_setup_error(self):

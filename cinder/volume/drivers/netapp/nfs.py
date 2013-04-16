@@ -26,7 +26,6 @@ import suds
 from suds.sax import text
 
 from cinder import exception
-from cinder import flags
 from cinder.openstack.common import log as logging
 from cinder.volume.drivers.netapp.api import NaApiError
 from cinder.volume.drivers.netapp.api import NaElement
@@ -41,10 +40,6 @@ netapp_nfs_opts = [
                default=0,
                help='Does snapshot creation call returns immediately')]
 
-FLAGS = flags.FLAGS
-FLAGS.register_opts(netapp_opts)
-FLAGS.register_opts(netapp_nfs_opts)
-
 
 class NetAppNFSDriver(nfs.NfsDriver):
     """Executes commands relating to Volumes."""
@@ -53,6 +48,8 @@ class NetAppNFSDriver(nfs.NfsDriver):
         self._execute = None
         self._context = None
         super(NetAppNFSDriver, self).__init__(*args, **kwargs)
+        self.configuration.append_config_values(netapp_opts)
+        self.configuration.append_config_values(netapp_nfs_opts)
 
     def set_execute(self, execute):
         self._execute = execute
@@ -60,11 +57,11 @@ class NetAppNFSDriver(nfs.NfsDriver):
     def do_setup(self, context):
         self._context = context
         self.check_for_setup_error()
-        self._client = NetAppNFSDriver._get_client()
+        self._client = self._get_client()
 
     def check_for_setup_error(self):
         """Returns an error if prerequisites aren't met"""
-        NetAppNFSDriver._check_dfm_flags()
+        self._check_dfm_flags()
         super(NetAppNFSDriver, self).check_for_setup_error()
 
     def create_volume_from_snapshot(self, volume, snapshot):
@@ -98,8 +95,7 @@ class NetAppNFSDriver(nfs.NfsDriver):
         self._execute('rm', self._get_volume_path(nfs_mount, snapshot.name),
                       run_as_root=True)
 
-    @staticmethod
-    def _check_dfm_flags():
+    def _check_dfm_flags(self):
         """Raises error if any required configuration flag for OnCommand proxy
         is missing."""
         required_flags = ['netapp_wsdl_url',
@@ -108,17 +104,18 @@ class NetAppNFSDriver(nfs.NfsDriver):
                           'netapp_server_hostname',
                           'netapp_server_port']
         for flag in required_flags:
-            if not getattr(FLAGS, flag, None):
+            if not getattr(self.configuration, flag, None):
                 raise exception.CinderException(_('%s is not set') % flag)
 
-    @staticmethod
-    def _get_client():
+    def _get_client(self):
         """Creates SOAP _client for ONTAP-7 DataFabric Service."""
-        client = suds.client.Client(FLAGS.netapp_wsdl_url,
-                                    username=FLAGS.netapp_login,
-                                    password=FLAGS.netapp_password)
-        soap_url = 'http://%s:%s/apis/soap/v1' % (FLAGS.netapp_server_hostname,
-                                                  FLAGS.netapp_server_port)
+        client = suds.client.Client(
+            self.configuration.netapp_wsdl_url,
+            username=self.configuration.netapp_login,
+            password=self.configuration.netapp_password)
+        soap_url = 'http://%s:%s/apis/soap/v1' % (
+            self.configuration.netapp_server_hostname,
+            self.configuration.netapp_server_port)
         client.set_options(location=soap_url)
 
         return client
@@ -148,7 +145,8 @@ class NetAppNFSDriver(nfs.NfsDriver):
         resp = self._client.service.ApiProxy(Target=host_id,
                                              Request=request)
 
-        if resp.Status == 'passed' and FLAGS.synchronous_snapshot_create:
+        if (resp.Status == 'passed' and
+                self.configuration.synchronous_snapshot_create):
             clone_id = resp.Results['clone-id'][0]
             clone_id_info = clone_id['clone-id-info'][0]
             clone_operation_id = int(clone_id_info['clone-op-id'][0])
@@ -251,7 +249,7 @@ class NetAppNFSDriver(nfs.NfsDriver):
                 return True
             except exception.ProcessExecutionError:
                 tries = tries + 1
-                if tries >= FLAGS.num_shell_tries:
+                if tries >= self.configuration.num_shell_tries:
                     raise
                 LOG.exception(_("Recovering from a failed execute.  "
                                 "Try number %s"), tries)
@@ -282,31 +280,15 @@ class NetAppNFSDriver(nfs.NfsDriver):
 
         return {'provider_location': share}
 
-    def get_volume_stats(self, refresh=False):
-        """Get volume status.
-
-        If 'refresh' is True, run update the stats first."""
-        if refresh:
-            self._update_volume_status()
-
-        return self._stats
-
     def _update_volume_status(self):
         """Retrieve status info from volume group."""
+        super(NetAppNFSDriver, self)._update_volume_status()
 
-        LOG.debug(_("Updating volume status"))
-        data = {}
         backend_name = self.configuration.safe_get('volume_backend_name')
-        data["volume_backend_name"] = backend_name or 'NetApp_NFS_7mode'
-        data["vendor_name"] = 'NetApp'
-        data["driver_version"] = '1.0'
-        data["storage_protocol"] = 'NFS'
-
-        data['total_capacity_gb'] = 'infinite'
-        data['free_capacity_gb'] = 'infinite'
-        data['reserved_percentage'] = 100
-        data['QoS_support'] = False
-        self._stats = data
+        self._stats["volume_backend_name"] = (backend_name or
+                                              'NetApp_NFS_7mode')
+        self._stats["vendor_name"] = 'NetApp'
+        self._stats["driver_version"] = '1.0'
 
 
 class NetAppCmodeNfsDriver (NetAppNFSDriver):
@@ -317,11 +299,11 @@ class NetAppCmodeNfsDriver (NetAppNFSDriver):
     def do_setup(self, context):
         self._context = context
         self.check_for_setup_error()
-        self._client = NetAppCmodeNfsDriver._get_client()
+        self._client = self._get_client()
 
     def check_for_setup_error(self):
         """Returns an error if prerequisites aren't met"""
-        NetAppCmodeNfsDriver._check_flags()
+        self._check_flags()
 
     def _clone_volume(self, volume_name, clone_name, volume_id):
         """Clones mounted volume with NetApp Cloud Services"""
@@ -333,8 +315,7 @@ class NetAppCmodeNfsDriver (NetAppNFSDriver):
         self._client.service.CloneNasFile(host_ip, export_path,
                                           volume_name, clone_name)
 
-    @staticmethod
-    def _check_flags():
+    def _check_flags(self):
         """Raises error if any required configuration flag for NetApp Cloud
         Webservices is missing."""
         required_flags = ['netapp_wsdl_url',
@@ -343,42 +324,26 @@ class NetAppCmodeNfsDriver (NetAppNFSDriver):
                           'netapp_server_hostname',
                           'netapp_server_port']
         for flag in required_flags:
-            if not getattr(FLAGS, flag, None):
+            if not getattr(self.configuration, flag, None):
                 raise exception.CinderException(_('%s is not set') % flag)
 
-    @staticmethod
-    def _get_client():
+    def _get_client(self):
         """Creates SOAP _client for NetApp Cloud service."""
-        client = suds.client.Client(FLAGS.netapp_wsdl_url,
-                                    username=FLAGS.netapp_login,
-                                    password=FLAGS.netapp_password)
+        client = suds.client.Client(
+            self.configuration.netapp_wsdl_url,
+            username=self.configuration.netapp_login,
+            password=self.configuration.netapp_password)
         return client
-
-    def get_volume_stats(self, refresh=False):
-        """Get volume status.
-
-        If 'refresh' is True, run update the stats first."""
-        if refresh:
-            self._update_volume_status()
-
-        return self._stats
 
     def _update_volume_status(self):
         """Retrieve status info from volume group."""
+        super(NetAppCmodeNfsDriver, self)._update_volume_status()
 
-        LOG.debug(_("Updating volume status"))
-        data = {}
         backend_name = self.configuration.safe_get('volume_backend_name')
-        data["volume_backend_name"] = backend_name or 'NetApp_NFS_Cluster'
-        data["vendor_name"] = 'NetApp'
-        data["driver_version"] = '1.0'
-        data["storage_protocol"] = 'NFS'
-
-        data['total_capacity_gb'] = 'infinite'
-        data['free_capacity_gb'] = 'infinite'
-        data['reserved_percentage'] = 100
-        data['QoS_support'] = False
-        self._stats = data
+        self._stats["volume_backend_name"] = (backend_name or
+                                              'NetApp_NFS_Cluster')
+        self._stats["vendor_name"] = 'NetApp'
+        self._stats["driver_version"] = '1.0'
 
 
 class NetAppDirectNfsDriver (NetAppNFSDriver):
@@ -389,19 +354,18 @@ class NetAppDirectNfsDriver (NetAppNFSDriver):
     def do_setup(self, context):
         self._context = context
         self.check_for_setup_error()
-        self._client = NetAppDirectNfsDriver._get_client()
+        self._client = self._get_client()
         self._do_custom_setup(self._client)
 
     def check_for_setup_error(self):
         """Returns an error if prerequisites aren't met"""
-        NetAppDirectNfsDriver._check_flags()
+        self._check_flags()
 
     def _clone_volume(self, volume_name, clone_name, volume_id):
         """Clones mounted volume on NetApp filer"""
         raise NotImplementedError()
 
-    @staticmethod
-    def _check_flags():
+    def _check_flags(self):
         """Raises error if any required configuration flag for NetApp
         filer is missing."""
         required_flags = ['netapp_login',
@@ -410,18 +374,18 @@ class NetAppDirectNfsDriver (NetAppNFSDriver):
                           'netapp_server_port',
                           'netapp_transport_type']
         for flag in required_flags:
-            if not getattr(FLAGS, flag, None):
+            if not getattr(self.configuration, flag, None):
                 raise exception.CinderException(_('%s is not set') % flag)
 
-    @staticmethod
-    def _get_client():
+    def _get_client(self):
         """Creates NetApp api client."""
-        client = NaServer(host=FLAGS.netapp_server_hostname,
-                          server_type=NaServer.SERVER_TYPE_FILER,
-                          transport_type=FLAGS.netapp_transport_type,
-                          style=NaServer.STYLE_LOGIN_PASSWORD,
-                          username=FLAGS.netapp_login,
-                          password=FLAGS.netapp_password)
+        client = NaServer(
+            host=self.configuration.netapp_server_hostname,
+            server_type=NaServer.SERVER_TYPE_FILER,
+            transport_type=self.configuration.netapp_transport_type,
+            style=NaServer.STYLE_LOGIN_PASSWORD,
+            username=self.configuration.netapp_login,
+            password=self.configuration.netapp_password)
         return client
 
     def _do_custom_setup(self, client):
@@ -529,32 +493,15 @@ class NetAppDirectCmodeNfsDriver (NetAppDirectNfsDriver):
             'destination-path': dest_path})
         self._invoke_successfully(clone_create, vserver)
 
-    def get_volume_stats(self, refresh=False):
-        """Get volume status.
-
-        If 'refresh' is True, run update the stats first."""
-        if refresh:
-            self._update_volume_status()
-
-        return self._stats
-
     def _update_volume_status(self):
         """Retrieve status info from volume group."""
+        super(NetAppDirectCmodeNfsDriver, self)._update_volume_status()
 
-        LOG.debug(_("Updating volume status"))
-        data = {}
         backend_name = self.configuration.safe_get('volume_backend_name')
-        data["volume_backend_name"] = (backend_name
-                                       or 'NetApp_NFS_cluster_direct')
-        data["vendor_name"] = 'NetApp'
-        data["driver_version"] = '1.0'
-        data["storage_protocol"] = 'NFS'
-
-        data['total_capacity_gb'] = 'infinite'
-        data['free_capacity_gb'] = 'infinite'
-        data['reserved_percentage'] = 100
-        data['QoS_support'] = False
-        self._stats = data
+        self._stats["volume_backend_name"] = (backend_name or
+                                              'NetApp_NFS_cluster_direct')
+        self._stats["vendor_name"] = 'NetApp'
+        self._stats["driver_version"] = '1.0'
 
 
 class NetAppDirect7modeNfsDriver (NetAppDirectNfsDriver):
@@ -659,29 +606,12 @@ class NetAppDirect7modeNfsDriver (NetAppDirectNfsDriver):
                 time.sleep(5)
             retry = retry - 1
 
-    def get_volume_stats(self, refresh=False):
-        """Get volume status.
-
-        If 'refresh' is True, run update the stats first."""
-        if refresh:
-            self._update_volume_status()
-
-        return self._stats
-
     def _update_volume_status(self):
         """Retrieve status info from volume group."""
+        super(NetAppDirect7modeNfsDriver, self)._update_volume_status()
 
-        LOG.debug(_("Updating volume status"))
-        data = {}
         backend_name = self.configuration.safe_get('volume_backend_name')
-        data["volume_backend_name"] = (backend_name
-                                       or 'NetApp_NFS_7mode_direct')
-        data["vendor_name"] = 'NetApp'
-        data["driver_version"] = '1.0'
-        data["storage_protocol"] = 'NFS'
-
-        data['total_capacity_gb'] = 'infinite'
-        data['free_capacity_gb'] = 'infinite'
-        data['reserved_percentage'] = 100
-        data['QoS_support'] = False
-        self._stats = data
+        self._stats["volume_backend_name"] = (backend_name or
+                                              'NetApp_NFS_7mode_direct')
+        self._stats["vendor_name"] = 'NetApp'
+        self._stats["driver_version"] = '1.0'

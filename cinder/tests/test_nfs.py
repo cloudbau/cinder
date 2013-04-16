@@ -20,6 +20,8 @@ import __builtin__
 import errno
 import os
 
+from oslo.config import cfg
+
 import mox as mox_lib
 from mox import IgnoreArg
 from mox import IsA
@@ -154,6 +156,7 @@ class NfsDriverTestCase(test.TestCase):
         self.configuration = mox_lib.MockObject(conf.Configuration)
         self.configuration.append_config_values(mox_lib.IgnoreArg())
         self.configuration.nfs_shares_config = None
+        self.configuration.nfs_mount_options = None
         self.configuration.nfs_mount_point_base = '$state_path/mnt'
         self.configuration.nfs_disk_util = 'df'
         self.configuration.nfs_sparsed_volumes = True
@@ -335,9 +338,11 @@ class NfsDriverTestCase(test.TestCase):
         mox = self._mox
         drv = self._driver
 
+        df_total_size = 2620544
         df_avail = 1490560
         df_head = 'Filesystem 1K-blocks Used Available Use% Mounted on\n'
-        df_data = 'nfs-host:/export 2620544 996864 %d 41%% /mnt' % df_avail
+        df_data = 'nfs-host:/export %d 996864 %d 41%% /mnt' % (df_total_size,
+                                                               df_avail)
         df_output = df_head + df_data
 
         self.configuration.nfs_disk_util = 'df'
@@ -352,7 +357,7 @@ class NfsDriverTestCase(test.TestCase):
 
         mox.ReplayAll()
 
-        self.assertEquals(df_avail,
+        self.assertEquals((df_avail, df_total_size),
                           drv._get_available_capacity(self.TEST_NFS_EXPORT1))
 
         mox.VerifyAll()
@@ -390,7 +395,7 @@ class NfsDriverTestCase(test.TestCase):
 
         mox.ReplayAll()
 
-        self.assertEquals(df_total_size - du_used,
+        self.assertEquals((df_total_size - du_used, df_total_size),
                           drv._get_available_capacity(self.TEST_NFS_EXPORT1))
 
         mox.VerifyAll()
@@ -473,8 +478,7 @@ class NfsDriverTestCase(test.TestCase):
     def test_setup_should_throw_error_if_shares_config_not_configured(self):
         """do_setup should throw error if shares config is not configured."""
         drv = self._driver
-
-        nfs.FLAGS.nfs_shares_config = self.TEST_SHARES_CONFIG_FILE
+        self.configuration.nfs_shares_config = self.TEST_SHARES_CONFIG_FILE
 
         self.assertRaises(exception.NfsException,
                           drv.do_setup, IsA(context.RequestContext))
@@ -484,7 +488,6 @@ class NfsDriverTestCase(test.TestCase):
         mox = self._mox
         drv = self._driver
         self.configuration.nfs_shares_config = self.TEST_SHARES_CONFIG_FILE
-        nfs.FLAGS.nfs_shares_config = self.TEST_SHARES_CONFIG_FILE
 
         mox.StubOutWithMock(os.path, 'exists')
         os.path.exists(self.TEST_SHARES_CONFIG_FILE).AndReturn(True)
@@ -517,9 +520,9 @@ class NfsDriverTestCase(test.TestCase):
 
         mox.StubOutWithMock(drv, '_get_available_capacity')
         drv._get_available_capacity(self.TEST_NFS_EXPORT1).\
-            AndReturn(2 * self.ONE_GB_IN_BYTES)
+            AndReturn((2 * self.ONE_GB_IN_BYTES, 5 * self.ONE_GB_IN_BYTES))
         drv._get_available_capacity(self.TEST_NFS_EXPORT2).\
-            AndReturn(3 * self.ONE_GB_IN_BYTES)
+            AndReturn((3 * self.ONE_GB_IN_BYTES, 10 * self.ONE_GB_IN_BYTES))
 
         mox.ReplayAll()
 
@@ -537,9 +540,9 @@ class NfsDriverTestCase(test.TestCase):
 
         mox.StubOutWithMock(drv, '_get_available_capacity')
         drv._get_available_capacity(self.TEST_NFS_EXPORT1).\
-            AndReturn(0)
+            AndReturn((0, 5 * self.ONE_GB_IN_BYTES))
         drv._get_available_capacity(self.TEST_NFS_EXPORT2).\
-            AndReturn(0)
+            AndReturn((0, 10 * self.ONE_GB_IN_BYTES))
 
         mox.ReplayAll()
 
@@ -561,7 +564,7 @@ class NfsDriverTestCase(test.TestCase):
         drv = self._driver
         volume = self._simple_volume()
 
-        setattr(nfs.FLAGS, 'nfs_sparsed_volumes', True)
+        setattr(cfg.CONF, 'nfs_sparsed_volumes', True)
 
         mox.StubOutWithMock(drv, '_create_sparsed_file')
         mox.StubOutWithMock(drv, '_set_rw_permissions_for_all')
@@ -575,7 +578,7 @@ class NfsDriverTestCase(test.TestCase):
 
         mox.VerifyAll()
 
-        delattr(nfs.FLAGS, 'nfs_sparsed_volumes')
+        delattr(cfg.CONF, 'nfs_sparsed_volumes')
 
     def test_create_nonsparsed_volume(self):
         mox = self._mox
@@ -583,7 +586,7 @@ class NfsDriverTestCase(test.TestCase):
         self.configuration.nfs_sparsed_volumes = False
         volume = self._simple_volume()
 
-        setattr(nfs.FLAGS, 'nfs_sparsed_volumes', False)
+        setattr(cfg.CONF, 'nfs_sparsed_volumes', False)
 
         mox.StubOutWithMock(drv, '_create_regular_file')
         mox.StubOutWithMock(drv, '_set_rw_permissions_for_all')
@@ -597,7 +600,7 @@ class NfsDriverTestCase(test.TestCase):
 
         mox.VerifyAll()
 
-        delattr(nfs.FLAGS, 'nfs_sparsed_volumes')
+        delattr(cfg.CONF, 'nfs_sparsed_volumes')
 
     def test_create_volume_should_ensure_nfs_mounted(self):
         """create_volume ensures shares provided in config are mounted."""
@@ -727,5 +730,30 @@ class NfsDriverTestCase(test.TestCase):
         mox.ReplayAll()
 
         drv.delete_volume(volume)
+
+        mox.VerifyAll()
+
+    def test_get_volume_stats(self):
+        """get_volume_stats must fill the correct values"""
+        mox = self._mox
+        drv = self._driver
+
+        drv._mounted_shares = [self.TEST_NFS_EXPORT1, self.TEST_NFS_EXPORT2]
+
+        mox.StubOutWithMock(drv, '_ensure_shares_mounted')
+        mox.StubOutWithMock(drv, '_get_available_capacity')
+
+        drv._ensure_shares_mounted()
+
+        drv._get_available_capacity(self.TEST_NFS_EXPORT1).\
+            AndReturn((2 * self.ONE_GB_IN_BYTES, 10 * self.ONE_GB_IN_BYTES))
+        drv._get_available_capacity(self.TEST_NFS_EXPORT2).\
+            AndReturn((3 * self.ONE_GB_IN_BYTES, 20 * self.ONE_GB_IN_BYTES))
+
+        mox.ReplayAll()
+
+        drv.get_volume_stats()
+        self.assertEqual(drv._stats['total_capacity_gb'], 30.0)
+        self.assertEqual(drv._stats['free_capacity_gb'], 5.0)
 
         mox.VerifyAll()

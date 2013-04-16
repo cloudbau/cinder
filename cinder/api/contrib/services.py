@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 IBM
+# Copyright 2012 IBM Corp.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -109,7 +109,7 @@ class ServiceController(object):
             host = body['host']
             service = body['service']
         except (TypeError, KeyError):
-            raise webob.exc.HTTPUnprocessableEntity()
+            raise webob.exc.HTTPBadRequest()
 
         try:
             svc = db.service_get_by_args(context, host, service)

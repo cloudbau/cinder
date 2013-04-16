@@ -333,6 +333,9 @@ class ISCSIDriver(VolumeDriver):
 
         """
 
+        if self.configuration.iscsi_helper == 'lioadm':
+            self.tgtadm.initialize_connection(volume, connector)
+
         iscsi_properties = self._get_iscsi_properties(volume)
         return {
             'driver_volume_type': 'iscsi',
@@ -436,7 +439,7 @@ class ISCSIDriver(VolumeDriver):
                      locals())
 
             # The rescan isn't documented as being necessary(?), but it helps
-            self._run_iscsiadm(iscsi_properties, ("--rescan"))
+            self._run_iscsiadm(iscsi_properties, ("--rescan",))
 
             tries = tries + 1
             if not os.path.exists(host_device):
