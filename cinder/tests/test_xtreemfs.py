@@ -16,17 +16,20 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import os
 import errno
+import io
+import os
 import random
-import __builtin__
 
 import mox
-from mox import IsA, IgnoreArg
+from mox import IgnoreArg
 
+from mock import patch
+
+from cinder import exception
+from cinder import test
 from cinder.volume import configuration
 from cinder.volume.drivers import xtreemfs
-from cinder import test, context, exception
 
 
 MAX = 2 << 20  # Dummy max size in Byte.
@@ -65,8 +68,7 @@ class XtreemFsDriverTestCase(test.TestCase):
         self._config.xtreemfs_shares_config = ""
         self.assertRaises(
             exception.XtreemfsException,
-            self._driver.do_setup,
-            IsA(context.RequestContext)
+            self._driver.check_for_setup_error
         )
 
     def test_setup_with_unexisting_shares_config_file(self):
@@ -78,8 +80,7 @@ class XtreemFsDriverTestCase(test.TestCase):
         # Should raise an error if path doesn't exist.
         self.assertRaises(
             exception.XtreemfsException,
-            self._driver.do_setup,
-            IsA(context.RequestContext)
+            self._driver.check_for_setup_error
         )
         self._mocker.VerifyAll()
 
@@ -90,14 +91,13 @@ class XtreemFsDriverTestCase(test.TestCase):
         os.path.exists(self.shares_config_filepath).AndReturn(True)
         # Mock execute method to fail locating the mount.xtreemfs command.
         self._mocker.StubOutWithMock(self._driver, '_execute')
-        self._driver._execute('mount.xtreemfs', check_exit_code=False).\
-                     AndRaise(
-                         OSError(errno.ENOENT, 'No such file or directory'))
+        call = self._driver._execute('mount.xtreemfs', check_exit_code=False)
+        call.AndRaise(OSError(errno.ENOENT, 'No such file or directory'))
+
         self._mocker.ReplayAll()
         self.assertRaises(
             exception.XtreemfsException,
-            self._driver.do_setup,
-            IsA(context.RequestContext)
+            self._driver.check_for_setup_error
         )
         self._mocker.VerifyAll()
 
@@ -105,7 +105,7 @@ class XtreemFsDriverTestCase(test.TestCase):
         "Find share should raise an error if no share was given."
         self._driver._mounted_shares = []
         self.assertRaises(
-            exception.XtreemfsNoSharesMounted,
+            exception.XtreemfsNoSuitableShareFound,
             self._driver._find_share,
             1
         )
@@ -128,16 +128,16 @@ class XtreemFsDriverTestCase(test.TestCase):
     def test_read_shares_from_config(self):
         "Test read shares from the shares config file."
         # Mock Python builtin's open function to read shares config file.
-        self._mocker.StubOutWithMock(__builtin__, "open")
-        __builtin__.open(self.shares_config_filepath).AndReturn(
+        conf_file = io.StringIO(u'\n'.join(
             self.available_shares + ["# ignored"]
-        )
-        self._mocker.ReplayAll()
-        self.assertEquals(
-            self.available_shares,
-            self._driver._load_shares_config()
-        )
-        self._mocker.VerifyAll()
+        ))
+        with patch("__builtin__.open", return_value=conf_file):
+            self._mocker.ReplayAll()
+            self.assertEquals(
+                self.available_shares,
+                self._driver._load_shares_from_config()
+            )
+            self._mocker.VerifyAll()
 
     def test_get_capacity_with_df(self):
         "Test getting volume capacity using df command."
@@ -157,8 +157,7 @@ class XtreemFsDriverTestCase(test.TestCase):
         self._mocker.StubOutWithMock(self._driver, "_execute")
         self._driver._execute(
             "df", "--portability", "--block-size", "1",
-            self.mount_point,
-            run_as_root=True
+            self.mount_point
         ).AndReturn((cmd_output, None))
         self._mocker.ReplayAll()
         # Check that the returned capacity is the same returned by df command.
@@ -188,16 +187,14 @@ class XtreemFsDriverTestCase(test.TestCase):
         self._mocker.StubOutWithMock(self._driver, '_execute')
         self._driver._execute(
             "df", "--portability", "--block-size", "1",
-            self.mount_point,
-            run_as_root=True
+            self.mount_point
         ).AndReturn((cmd_output, None))
         # Mock execute command to return dummy result for du command.
         used = random.randint(1, MAX)
         cmd_output = "%d /mnt" % used
         self._driver._execute(
             "du", "-sb", "--apparent-size", "--exclude", "*snapshot*",
-            self.mount_point,
-            run_as_root=True
+            self.mount_point
         ).AndReturn((cmd_output, None))
 
         self._mocker.ReplayAll()
@@ -215,11 +212,11 @@ class XtreemFsDriverTestCase(test.TestCase):
         self._mocker.StubOutWithMock(
             self._driver, '_get_mount_point_for_share'
         )
-        self._driver._get_mount_point_for_share(share).\
-                     AndReturn(self.mount_point)
+        call = self._driver._get_mount_point_for_share(share)
+        call.AndReturn(self.mount_point)
         # Mock mounting volume to do nothing.
         self._mocker.StubOutWithMock(self._driver, '_mount_xtreemfs')
-        self._driver._mount_xtreemfs(share, self.mount_point, ensure=True)
+        self._driver._mount_xtreemfs(share, self.mount_point)
 
         self._mocker.ReplayAll()
         self._driver._ensure_share_mounted(share)
@@ -228,8 +225,9 @@ class XtreemFsDriverTestCase(test.TestCase):
     def test_ensure_shares_save(self):
         "Check that ensure mounted shares save loaded share."
         # Mock loading shared config to return dummy shares.
-        self._mocker.StubOutWithMock(self._driver, '_load_shares_config')
-        self._driver._load_shares_config().AndReturn(self.available_shares)
+        self._mocker.StubOutWithMock(self._driver, '_load_shares_from_config')
+        self._driver._load_shares_from_config().AndReturn(
+            self.available_shares)
         # Mock ensuring single share to do nothing.
         self._mocker.StubOutWithMock(self._driver, '_ensure_share_mounted')
         for share in self.available_shares:
@@ -245,8 +243,9 @@ class XtreemFsDriverTestCase(test.TestCase):
     def test_ensure_shares_save_only_correct_share(self):
         "Check that only shares that don't raise any error get loaded."
         # Mock loading shared config to return dummy shares.
-        self._mocker.StubOutWithMock(self._driver, '_load_shares_config')
-        self._driver._load_shares_config().AndReturn(self.available_shares)
+        self._mocker.StubOutWithMock(self._driver, '_load_shares_from_config')
+        self._driver._load_shares_from_config().AndReturn(
+            self.available_shares)
         # Mock ensuring single share to succeed all except the first one.
         self._mocker.StubOutWithMock(self._driver, '_ensure_share_mounted')
         self._driver._ensure_share_mounted(self.available_shares[0])\
@@ -272,8 +271,8 @@ class XtreemFsDriverTestCase(test.TestCase):
         self._driver._do_create_volume(volume)
         # Mock finding share to return dummy share.
         self._mocker.StubOutWithMock(self._driver, "_find_share")
-        self._driver._find_share(volume["size"]). \
-                     AndReturn(volume["provider_location"])
+        call = self._driver._find_share(volume["size"])
+        call.AndReturn(volume["provider_location"])
 
         self._mocker.ReplayAll()
         self.assertDictEqual(
@@ -322,16 +321,13 @@ class XtreemFsDriverTestCase(test.TestCase):
         # Mock getting volume local path to return dummy value.
         self._mocker.StubOutWithMock(self._driver, "local_path")
         self._driver.local_path(volume).AndReturn(volume_path)
-        # Mock checking if path exist to return True for the dummy volume.
-        self._mocker.StubOutWithMock(self._driver, "_path_exists")
-        self._driver._path_exists(volume_path).AndReturn(True)
         # Mock removing local volume path to do nothing.
         self._mocker.StubOutWithMock(self._driver, "_execute")
-        self._driver._execute("rm", "-f", volume_path, run_as_root=True)
+        self._driver._execute("rm", "-f", volume_path)
         # Mock mounting a volume.
         self._mocker.StubOutWithMock(self._driver, "_mount_xtreemfs")
         self._driver._mount_xtreemfs(
-            volume["provider_location"], volume_path, ensure=True
+            volume["provider_location"], volume_path
         )
 
         self._mocker.ReplayAll()
@@ -354,9 +350,6 @@ class XtreemFsDriverTestCase(test.TestCase):
         # Mock getting volume loval path tp return dummy value.
         self._mocker.StubOutWithMock(self._driver, "local_path")
         self._driver.local_path(volume).AndReturn(volume_path)
-        # Mock checking if path exist to return False.
-        self._mocker.StubOutWithMock(self._driver, "_path_exists")
-        self._driver._path_exists(volume_path).AndReturn(False)
         # Mock ensure share mounted to do nothing.
         self._mocker.StubOutWithMock(self._driver, "_ensure_share_mounted")
         self._driver._ensure_share_mounted(volume["provider_location"])
@@ -368,13 +361,12 @@ class XtreemFsDriverTestCase(test.TestCase):
     def test_mount_volume(self):
         "Test mounting a volume."
         share = self.available_shares[0]
-        # Mock checking if mounting path exist to return true.
-        self._mocker.StubOutWithMock(self._driver, "_path_exists")
-        self._driver._path_exists(self.mount_point).AndReturn(True)
         # Mock running xtreemfs mount command to do nothing.
         self._mocker.StubOutWithMock(self._driver, "_execute")
+        self._driver._execute("mkdir", "-p", self.mount_point)
         self._driver._execute(
-            "mount.xtreemfs", share, self.mount_point, run_as_root=True
+            "mount.xtreemfs", '-o', 'allow_other', share, self.mount_point,
+            run_as_root=True
         )
 
         self._mocker.ReplayAll()
@@ -382,52 +374,33 @@ class XtreemFsDriverTestCase(test.TestCase):
         self._mocker.VerifyAll()
 
     def test_mount_volume_failure(self):
-        "Failure in mounting should be silent if ensure is True."
+        "Failure in mounting should be raised."
         share = self.available_shares[0]
-        # Mock checking if path exist with a dummy value.
-        self._mocker.StubOutWithMock(self._driver, "_path_exists")
-        self._driver._path_exists(self.mount_point).AndReturn(True)
         # Mock running xtreemfs mount command to raise an error.
         self._mocker.StubOutWithMock(self._driver, "_execute")
+        self._driver._execute("mkdir", "-p", self.mount_point)
         self._driver._execute(
-            "mount.xtreemfs", share, self.mount_point, run_as_root=True
-        ).AndRaise(exception.ProcessExecutionError(stderr="already mounted"))
-
-        self._mocker.ReplayAll()
-        self._driver._mount_xtreemfs(share, self.mount_point, ensure=True)
-        self._mocker.VerifyAll()
-
-    def test_mount_volume_failure_silence(self):
-        "Failure in mounting should be raised if ensure is True."
-        share = self.available_shares[0]
-        # Mock checking if path exist with a dummy value.
-        self._mocker.StubOutWithMock(self._driver, "_path_exists")
-        self._driver._path_exists(self.mount_point).AndReturn(True)
-        # Mock running xtreemfs mount command to raise an error.
-        self._mocker.StubOutWithMock(self._driver, "_execute")
-        self._driver._execute(
-            "mount.xtreemfs", share, self.mount_point, run_as_root=True
+            "mount.xtreemfs", '-o', 'allow_other', share, self.mount_point,
+            run_as_root=True
         ).AndRaise(exception.ProcessExecutionError(stderr="already mounted"))
 
         self._mocker.ReplayAll()
         self.assertRaises(
             exception.ProcessExecutionError, self._driver._mount_xtreemfs,
-            share, self.mount_point, ensure=False
+            share, self.mount_point
         )
         self._mocker.VerifyAll()
 
     def test_mount_volume_with_unexisting_mounting_point(self):
         "Mounting a volume should create mounting point if it doesn't exist."
         share = self.available_shares[0]
-        # Mock checking if path exist with a dummy value.
-        self._mocker.StubOutWithMock(self._driver, "_path_exists")
-        self._driver._path_exists(self.mount_point).AndReturn(False)
         # Mock running mkdir for mounting point.
         self._mocker.StubOutWithMock(self._driver, "_execute")
         self._driver._execute("mkdir", "-p", self.mount_point)
         # Mock running xtreemfs mount.
         self._driver._execute(
-            "mount.xtreemfs", share, self.mount_point, run_as_root=True
+            "mount.xtreemfs", '-o', 'allow_other', share, self.mount_point,
+            run_as_root=True
         )
 
         self._mocker.ReplayAll()
