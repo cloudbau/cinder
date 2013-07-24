@@ -575,3 +575,19 @@ class InvalidBackup(Invalid):
 
 class SwiftConnectionFailed(CinderException):
     message = _("Connection to swift failed") + ": %(reason)s"
+
+
+class TransferNotFound(NotFound):
+    message = _("Transfer %(transfer_id)s could not be found.")
+
+
+class XtreemfsException(CinderException):
+    message = _("Xtreemfs misconfiguration")
+
+
+class XtreemfsNoSharesMounted(NotFound):
+    message = _("No mounted Xtreemfs shares was found")
+
+
+class XtreemfsNoSuitableShareFound(NotFound):
+    message = _("No suitable share was found to host %(volume_size)dG")

@@ -58,3 +58,6 @@ lvs: CommandFilter, /sbin/lvs, root
 # cinder/volume/scality.py
 mount: CommandFilter, /bin/mount, root
 dd: CommandFilter, /bin/dd, root
+
+# cinder/volumes/drivers/xtreemfs.py
+mount.xtreemfs: CommandFilter, /usr/bin/mount.xtreemfs, root
