@@ -89,3 +89,5 @@ aoe-flush: CommandFilter, aoe-flush, root
 
 #cinder/backup/services/tsm.py
 dsmc:CommandFilter,/usr/bin/dsmc,root
+# cinder/volumes/drivers/xtreemfs.py
+mount.xtreemfs: CommandFilter, /usr/bin/mount.xtreemfs, root

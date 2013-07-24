@@ -605,6 +605,7 @@ class TransferNotFound(NotFound):
     message = _("Transfer %(transfer_id)s could not be found.")
 
 
+<<<<<<< HEAD
 class VolumeMigrationFailed(CinderException):
     message = _("Volume migration failed") + ": %(reason)s"
 
@@ -684,3 +685,15 @@ class InvalidQoSSpecs(Invalid):
 
 class QoSSpecsInUse(CinderException):
     message = _("QoS Specs %(specs_id)s is still associated with entities.")
+
+
+class XtreemfsException(CinderException):
+    message = _("Xtreemfs misconfiguration")
+
+
+class XtreemfsNoSharesMounted(NotFound):
+    message = _("No mounted Xtreemfs shares was found")
+
+
+class XtreemfsNoSuitableShareFound(NotFound):
+    message = _("No suitable share was found to host %(volume_size)dG")
