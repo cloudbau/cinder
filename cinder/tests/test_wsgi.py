@@ -21,10 +21,10 @@
 import os.path
 import ssl
 import tempfile
-import unittest
 import urllib2
 
 from oslo.config import cfg
+import testtools
 import webob
 import webob.dec
 
@@ -54,7 +54,7 @@ class TestLoaderNothingExists(test.TestCase):
         )
 
 
-class TestLoaderNormalFilesystem(unittest.TestCase):
+class TestLoaderNormalFilesystem(test.TestCase):
     """Loader tests with normal filesystem (unmodified os.path module)."""
 
     _paste_config = """
@@ -64,11 +64,13 @@ document_root = /tmp
     """
 
     def setUp(self):
+        super(TestLoaderNormalFilesystem, self).setUp()
         self.config = tempfile.NamedTemporaryFile(mode="w+t")
         self.config.write(self._paste_config.lstrip())
         self.config.seek(0)
         self.config.flush()
         self.loader = cinder.wsgi.Loader(self.config.name)
+        self.addCleanup(self.config.close)
 
     def test_config_found(self):
         self.assertEquals(self.config.name, self.loader.config_path)
@@ -84,21 +86,15 @@ document_root = /tmp
         url_parser = self.loader.load_app("test_app")
         self.assertEquals("/tmp", url_parser.directory)
 
-    def tearDown(self):
-        self.config.close()
 
-
-class TestWSGIServer(unittest.TestCase):
+class TestWSGIServer(test.TestCase):
     """WSGI server tests."""
     def _ipv6_configured():
         try:
-            out, err = utils.execute('cat', '/proc/net/if_inet6')
-        except exception.ProcessExecutionError:
+            with file('/proc/net/if_inet6') as f:
+                return len(f.read()) > 0
+        except IOError:
             return False
-
-        if not out:
-            return False
-        return True
 
     def test_no_app(self):
         server = cinder.wsgi.Server("test_app", None)
@@ -112,8 +108,8 @@ class TestWSGIServer(unittest.TestCase):
         server.stop()
         server.wait()
 
-    @test.skip_if(not _ipv6_configured(),
-                  "Test requires an IPV6 configured interface")
+    @testtools.skipIf(not _ipv6_configured(),
+                      "Test requires an IPV6 configured interface")
     def test_start_random_port_with_ipv6(self):
         server = cinder.wsgi.Server("test_random_port",
                                     None,
@@ -163,8 +159,8 @@ class TestWSGIServer(unittest.TestCase):
 
         server.stop()
 
-    @test.skip_if(not _ipv6_configured(),
-                  "Test requires an IPV6 configured interface")
+    @testtools.skipIf(not _ipv6_configured(),
+                      "Test requires an IPV6 configured interface")
     def test_app_using_ipv6_and_ssl(self):
         CONF.set_default("ssl_cert_file",
                          os.path.join(TEST_VAR_DIR, 'certificate.crt'))

@@ -17,18 +17,19 @@ import webob
 
 from cinder.api.contrib import types_manage
 from cinder import exception
+from cinder.openstack.common.notifier import api as notifier_api
+from cinder.openstack.common.notifier import test_notifier
 from cinder import test
 from cinder.tests.api import fakes
 from cinder.volume import volume_types
 
 
 def stub_volume_type(id):
-    specs = {
-            "key1": "value1",
-            "key2": "value2",
-            "key3": "value3",
-            "key4": "value4",
-            "key5": "value5"}
+    specs = {"key1": "value1",
+             "key2": "value2",
+             "key3": "value3",
+             "key4": "value4",
+             "key5": "value5"}
     return dict(id=id, name='vol_type_%s' % str(id), extra_specs=specs)
 
 
@@ -57,7 +58,17 @@ def return_volume_types_get_by_name(context, name):
 class VolumeTypesManageApiTest(test.TestCase):
     def setUp(self):
         super(VolumeTypesManageApiTest, self).setUp()
+        self.flags(connection_type='fake',
+                   host='fake',
+                   notification_driver=[test_notifier.__name__])
         self.controller = types_manage.VolumeTypesManageController()
+        """to reset notifier drivers left over from other api/contrib tests"""
+        notifier_api._reset_drivers()
+        test_notifier.NOTIFICATIONS = []
+
+    def tearDown(self):
+        notifier_api._reset_drivers()
+        super(VolumeTypesManageApiTest, self).tearDown()
 
     def test_volume_types_delete(self):
         self.stubs.Set(volume_types, 'get_volume_type',
@@ -66,7 +77,9 @@ class VolumeTypesManageApiTest(test.TestCase):
                        return_volume_types_destroy)
 
         req = fakes.HTTPRequest.blank('/v2/fake/types/1')
+        self.assertEquals(len(test_notifier.NOTIFICATIONS), 0)
         self.controller._delete(req, 1)
+        self.assertEquals(len(test_notifier.NOTIFICATIONS), 1)
 
     def test_volume_types_delete_not_found(self):
         self.stubs.Set(volume_types, 'get_volume_type',
@@ -74,9 +87,11 @@ class VolumeTypesManageApiTest(test.TestCase):
         self.stubs.Set(volume_types, 'destroy',
                        return_volume_types_destroy)
 
+        self.assertEquals(len(test_notifier.NOTIFICATIONS), 0)
         req = fakes.HTTPRequest.blank('/v2/fake/types/777')
         self.assertRaises(webob.exc.HTTPNotFound, self.controller._delete,
                           req, '777')
+        self.assertEquals(len(test_notifier.NOTIFICATIONS), 1)
 
     def test_create(self):
         self.stubs.Set(volume_types, 'create',
@@ -87,8 +102,11 @@ class VolumeTypesManageApiTest(test.TestCase):
         body = {"volume_type": {"name": "vol_type_1",
                                 "extra_specs": {"key1": "value1"}}}
         req = fakes.HTTPRequest.blank('/v2/fake/types')
+
+        self.assertEquals(len(test_notifier.NOTIFICATIONS), 0)
         res_dict = self.controller._create(req, body)
 
+        self.assertEquals(len(test_notifier.NOTIFICATIONS), 1)
         self.assertEqual(1, len(res_dict))
         self.assertEqual('vol_type_1', res_dict['volume_type']['name'])
 

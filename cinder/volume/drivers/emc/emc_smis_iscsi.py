@@ -20,30 +20,26 @@ ISCSI Drivers for EMC VNX and VMAX arrays based on SMI-S.
 
 """
 
-import os
-import time
 
 from cinder import exception
-from cinder import flags
 from cinder.openstack.common import log as logging
-from cinder import utils
 from cinder.volume import driver
 from cinder.volume.drivers.emc import emc_smis_common
 
 LOG = logging.getLogger(__name__)
 
-FLAGS = flags.FLAGS
-
 
 class EMCSMISISCSIDriver(driver.ISCSIDriver):
     """EMC ISCSI Drivers for VMAX and VNX using SMI-S."""
 
+    VERSION = "1.0.0"
+
     def __init__(self, *args, **kwargs):
 
         super(EMCSMISISCSIDriver, self).__init__(*args, **kwargs)
-        self.common = emc_smis_common.EMCSMISCommon(
-                                        'iSCSI',
-                                        configuration=self.configuration)
+        self.common =\
+            emc_smis_common.EMCSMISCommon('iSCSI',
+                                          configuration=self.configuration)
 
     def check_for_setup_error(self):
         pass
@@ -227,19 +223,20 @@ class EMCSMISISCSIDriver(driver.ISCSIDriver):
         self.common.terminate_connection(volume, connector)
 
     def get_volume_stats(self, refresh=False):
-        """Get volume status.
+        """Get volume stats.
 
         If 'refresh' is True, run update the stats first.
         """
         if refresh:
-            self.update_volume_status()
+            self.update_volume_stats()
 
         return self._stats
 
-    def update_volume_status(self):
-        """Retrieve status info from volume group."""
-        LOG.debug(_("Updating volume status"))
-        data = self.common.update_volume_status()
-        data['volume_backend_name'] = 'EMCSMISISCSIDriver'
+    def update_volume_stats(self):
+        """Retrieve stats info from volume group."""
+        LOG.debug(_("Updating volume stats"))
+        data = self.common.update_volume_stats()
+        backend_name = self.configuration.safe_get('volume_backend_name')
+        data['volume_backend_name'] = backend_name or 'EMCSMISISCSIDriver'
         data['storage_protocol'] = 'iSCSI'
         self._stats = data

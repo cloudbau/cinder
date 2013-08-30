@@ -54,7 +54,7 @@ Linux Systems
 
 .. note::
 
-  This section is tested for Cinder on Ubuntu (10.10-64) and
+  This section is tested for Cinder on Ubuntu (12.04-64) and
   Fedora-based (RHEL 6.1) distributions. Feel free to add notes and
   change according to your experiences or operating system.
 
@@ -62,11 +62,11 @@ Install the prerequisite packages.
 
 On Ubuntu::
 
-  sudo apt-get install python-dev libssl-dev python-pip git-core
+  sudo apt-get install python-dev libssl-dev python-pip git-core libmysqlclient-dev libpq-dev
 
 On Fedora-based distributions (e.g., Fedora/RHEL/CentOS/Scientific Linux)::
 
-  sudo yum install python-devel openssl-devel python-pip git
+  sudo yum install python-devel openssl-devel python-pip git libmysqlclient-dev libqp-dev
 
 
 Mac OS X Systems
@@ -121,8 +121,8 @@ You can manually install the virtual environment instead of having
   python tools/install_venv.py
 
 This will install all of the Python packages listed in the
-``tools/pip-requires`` file into your virtualenv. There will also be some
-additional packages (pip, distribute, greenlet) that are installed
+``requirements.txt`` file into your virtualenv. There will also be some
+additional packages (pip, setuptools) that are installed
 by the ``tools/install_venv.py`` file into the virutalenv.
 
 If all goes well, you should get a message something like this::

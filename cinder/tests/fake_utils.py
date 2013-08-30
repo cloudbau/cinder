@@ -22,6 +22,7 @@ from eventlet import greenthread
 
 from cinder import exception
 from cinder.openstack.common import log as logging
+from cinder.openstack.common import processutils
 from cinder import utils
 
 LOG = logging.getLogger(__name__)
@@ -92,14 +93,13 @@ def fake_execute(*cmd_parts, **kwargs):
                                   attempts=attempts,
                                   run_as_root=run_as_root,
                                   check_exit_code=check_exit_code)
-        except exception.ProcessExecutionError as e:
+        except processutils.ProcessExecutionError as e:
             LOG.debug(_('Faked command raised an exception %s'), e)
             raise
 
-    stdout = reply[0]
-    stderr = reply[1]
     LOG.debug(_("Reply to faked command is stdout='%(stdout)s' "
-                "stderr='%(stderr)s'") % locals())
+                "stderr='%(stderr)s'") % {'stdout': reply[0],
+                                          'stderr': reply[1]})
 
     # Replicate the sleep call in the real function
     greenthread.sleep(0)

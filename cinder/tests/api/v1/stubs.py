@@ -32,8 +32,11 @@ def stub_volume(id, **kwargs):
         'size': 1,
         'availability_zone': 'fakeaz',
         'instance_uuid': 'fakeuuid',
+        'attached_host': None,
         'mountpoint': '/',
+        'attached_mode': 'rw',
         'status': 'fakestatus',
+        'migration_status': None,
         'attach_status': 'attached',
         'bootable': 'false',
         'name': 'vol name',
@@ -44,7 +47,8 @@ def stub_volume(id, **kwargs):
         'source_volid': None,
         'volume_type_id': '3e196c20-3c06-11e2-81c1-0800200c9a66',
         'volume_metadata': [],
-        'volume_type': {'name': 'vol_type_name'}}
+        'volume_type': {'name': 'vol_type_name'},
+        'readonly': 'False'}
 
     volume.update(kwargs)
     return volume
@@ -129,3 +133,7 @@ def stub_snapshot_get_all_by_project(self, context):
 
 def stub_snapshot_update(self, context, *args, **param):
     pass
+
+
+def stub_service_get_all_by_topic(context, topic):
+    return [{'availability_zone': "zone1:host1", "disabled": 0}]

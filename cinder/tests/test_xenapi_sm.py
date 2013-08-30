@@ -16,18 +16,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+
 import contextlib
 import StringIO
-import unittest
 
 import mock
 import mox
-from oslo.config import cfg
 
 from cinder.db import api as db_api
 from cinder import exception
+from cinder import test
 from cinder.volume import configuration as conf
-from cinder.volume import driver as parent_driver
 from cinder.volume.drivers.xenapi import lib
 from cinder.volume.drivers.xenapi import sm as driver
 from cinder.volume.drivers.xenapi import tools
@@ -51,10 +50,10 @@ def get_configured_driver(server='ignore_server', path='ignore_path'):
     return driver.XenAPINFSDriver(configuration=configuration)
 
 
-class DriverTestCase(unittest.TestCase):
+class DriverTestCase(test.TestCase):
 
     def assert_flag(self, flagname):
-        self.assertTrue(hasattr(driver.FLAGS, flagname))
+        self.assertTrue(hasattr(driver.CONF, flagname))
 
     def test_config_options(self):
         self.assert_flag('xenapi_connection_url')
@@ -210,10 +209,10 @@ class DriverTestCase(unittest.TestCase):
         drv.nfs_ops = ops
         drv.db = db
 
-        mock.StubOutWithMock(driver, 'FLAGS')
-        driver.FLAGS.xenapi_nfs_server = server
-        driver.FLAGS.xenapi_nfs_serverpath = serverpath
-        driver.FLAGS.xenapi_sr_base_path = sr_base_path
+        mock.StubOutWithMock(driver, 'CONF')
+        driver.CONF.xenapi_nfs_server = server
+        driver.CONF.xenapi_nfs_serverpath = serverpath
+        driver.CONF.xenapi_sr_base_path = sr_base_path
 
         return mock, drv
 
@@ -276,10 +275,10 @@ class DriverTestCase(unittest.TestCase):
             'server', 'serverpath', '/var/run/sr-mount')
 
         mock.StubOutWithMock(drv, '_use_glance_plugin_to_upload_volume')
-        mock.StubOutWithMock(driver, 'is_xenserver_format')
+        mock.StubOutWithMock(driver.image_utils, 'is_xenserver_format')
         context = MockContext('token')
 
-        driver.is_xenserver_format('image_meta').AndReturn(True)
+        driver.image_utils.is_xenserver_format('image_meta').AndReturn(True)
 
         drv._use_glance_plugin_to_upload_volume(
             context, 'volume', 'image_service', 'image_meta').AndReturn(
@@ -297,10 +296,10 @@ class DriverTestCase(unittest.TestCase):
             'server', 'serverpath', '/var/run/sr-mount')
 
         mock.StubOutWithMock(drv, '_use_image_utils_to_upload_volume')
-        mock.StubOutWithMock(driver, 'is_xenserver_format')
+        mock.StubOutWithMock(driver.image_utils, 'is_xenserver_format')
         context = MockContext('token')
 
-        driver.is_xenserver_format('image_meta').AndReturn(False)
+        driver.image_utils.is_xenserver_format('image_meta').AndReturn(False)
 
         drv._use_image_utils_to_upload_volume(
             context, 'volume', 'image_service', 'image_meta').AndReturn(
@@ -359,10 +358,10 @@ class DriverTestCase(unittest.TestCase):
             'server', 'serverpath', '/var/run/sr-mount')
 
         mock.StubOutWithMock(drv, '_use_glance_plugin_to_copy_image_to_volume')
-        mock.StubOutWithMock(driver, 'is_xenserver_image')
+        mock.StubOutWithMock(driver.image_utils, 'is_xenserver_image')
         context = MockContext('token')
 
-        driver.is_xenserver_image(
+        driver.image_utils.is_xenserver_image(
             context, 'image_service', 'image_id').AndReturn(True)
         drv._use_glance_plugin_to_copy_image_to_volume(
             context, 'volume', 'image_service', 'image_id').AndReturn('result')
@@ -377,10 +376,10 @@ class DriverTestCase(unittest.TestCase):
             'server', 'serverpath', '/var/run/sr-mount')
 
         mock.StubOutWithMock(drv, '_use_image_utils_to_pipe_bytes_to_volume')
-        mock.StubOutWithMock(driver, 'is_xenserver_image')
+        mock.StubOutWithMock(driver.image_utils, 'is_xenserver_image')
         context = MockContext('token')
 
-        driver.is_xenserver_image(
+        driver.image_utils.is_xenserver_image(
             context, 'image_service', 'image_id').AndReturn(False)
         drv._use_image_utils_to_pipe_bytes_to_volume(
             context, 'volume', 'image_service', 'image_id').AndReturn(True)
@@ -488,7 +487,7 @@ class DriverTestCase(unittest.TestCase):
         self.assertEquals('xensm', stats['storage_protocol'])
 
 
-class ToolsTest(unittest.TestCase):
+class ToolsTest(test.TestCase):
     @mock.patch('cinder.volume.drivers.xenapi.tools._stripped_first_line_of')
     def test_get_this_vm_uuid(self, mock_read_first_line):
         mock_read_first_line.return_value = 'someuuid'

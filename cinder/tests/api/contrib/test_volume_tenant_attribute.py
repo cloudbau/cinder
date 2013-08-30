@@ -44,6 +44,8 @@ def fake_volume_get(*args, **kwargs):
         'volume_type_id': None,
         'snapshot_id': None,
         'project_id': PROJECT_ID,
+        'migration_status': None,
+        '_name_id': 'fake2',
     }
 
 

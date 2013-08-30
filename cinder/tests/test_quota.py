@@ -16,14 +16,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+
 import datetime
+
+from oslo.config import cfg
 
 from cinder import context
 from cinder import db
 from cinder.db.sqlalchemy import api as sqa_api
 from cinder.db.sqlalchemy import models as sqa_models
 from cinder import exception
-from cinder import flags
 from cinder.openstack.common import rpc
 from cinder.openstack.common import timeutils
 from cinder import quota
@@ -32,19 +34,21 @@ import cinder.tests.image.fake
 from cinder import volume
 
 
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
 
 
 class QuotaIntegrationTestCase(test.TestCase):
 
     def setUp(self):
         super(QuotaIntegrationTestCase, self).setUp()
+        self.volume_type_name = CONF.default_volume_type
+        self.volume_type = db.volume_type_create(
+            context.get_admin_context(),
+            dict(name=self.volume_type_name))
+
         self.flags(quota_volumes=2,
                    quota_snapshots=2,
                    quota_gigabytes=20)
-
-        # Apparently needed by the RPC tests...
-        #self.network = self.start_service('network')
 
         self.user_id = 'admin'
         self.project_id = 'admin'
@@ -59,16 +63,19 @@ class QuotaIntegrationTestCase(test.TestCase):
         self.stubs.Set(rpc, 'call', rpc_call_wrapper)
 
     def tearDown(self):
+        db.volume_type_destroy(context.get_admin_context(),
+                               self.volume_type['id'])
         super(QuotaIntegrationTestCase, self).tearDown()
         cinder.tests.image.fake.FakeImageService_reset()
 
-    def _create_volume(self, size=10):
+    def _create_volume(self, size=1):
         """Create a test volume."""
         vol = {}
         vol['user_id'] = self.user_id
         vol['project_id'] = self.project_id
         vol['size'] = size
         vol['status'] = 'available'
+        vol['volume_type_id'] = self.volume_type['id']
         return db.volume_create(self.context, vol)
 
     def _create_snapshot(self, volume):
@@ -82,22 +89,55 @@ class QuotaIntegrationTestCase(test.TestCase):
 
     def test_too_many_volumes(self):
         volume_ids = []
-        for i in range(FLAGS.quota_volumes):
+        for i in range(CONF.quota_volumes):
             vol_ref = self._create_volume()
             volume_ids.append(vol_ref['id'])
-        self.assertRaises(exception.QuotaError,
+        self.assertRaises(exception.VolumeLimitExceeded,
                           volume.API().create,
-                          self.context, 10, '', '', None)
+                          self.context, 1, '', '',
+                          volume_type=self.volume_type)
         for volume_id in volume_ids:
             db.volume_destroy(self.context, volume_id)
+
+    def test_too_many_volumes_of_type(self):
+        resource = 'volumes_%s' % self.volume_type_name
+        db.quota_class_create(self.context, 'default', resource, 1)
+        flag_args = {
+            'quota_volumes': 2000,
+            'quota_gigabytes': 2000
+        }
+        self.flags(**flag_args)
+        vol_ref = self._create_volume()
+        self.assertRaises(exception.VolumeLimitExceeded,
+                          volume.API().create,
+                          self.context, 1, '', '',
+                          volume_type=self.volume_type)
+        db.volume_destroy(self.context, vol_ref['id'])
+
+    def test_too_many_snapshots_of_type(self):
+        resource = 'snapshots_%s' % self.volume_type_name
+        db.quota_class_create(self.context, 'default', resource, 1)
+        flag_args = {
+            'quota_volumes': 2000,
+            'quota_gigabytes': 2000,
+        }
+        self.flags(**flag_args)
+        vol_ref = self._create_volume()
+        snap_ref = self._create_snapshot(vol_ref)
+        self.assertRaises(exception.SnapshotLimitExceeded,
+                          volume.API().create_snapshot,
+                          self.context, vol_ref, '', '')
+        db.snapshot_destroy(self.context, snap_ref['id'])
+        db.volume_destroy(self.context, vol_ref['id'])
 
     def test_too_many_gigabytes(self):
         volume_ids = []
         vol_ref = self._create_volume(size=20)
         volume_ids.append(vol_ref['id'])
-        self.assertRaises(exception.QuotaError,
+        self.assertRaises(exception.VolumeSizeExceedsAvailableQuota,
                           volume.API().create,
-                          self.context, 10, '', '', None)
+                          self.context, 1, '', '',
+                          volume_type=self.volume_type)
         for volume_id in volume_ids:
             db.volume_destroy(self.context, volume_id)
 
@@ -129,8 +169,6 @@ class QuotaIntegrationTestCase(test.TestCase):
         self.assertEqual(reservations.get('gigabytes'), None)
 
         # Make sure the snapshot volume_size isn't included in usage.
-        vol_type = db.volume_type_create(self.context,
-                                         dict(name=FLAGS.default_volume_type))
         vol_ref2 = volume.API().create(self.context, 10, '', '')
         usages = db.quota_usage_get_all_by_project(self.context,
                                                    self.project_id)
@@ -140,7 +178,21 @@ class QuotaIntegrationTestCase(test.TestCase):
         db.snapshot_destroy(self.context, snap_ref2['id'])
         db.volume_destroy(self.context, vol_ref['id'])
         db.volume_destroy(self.context, vol_ref2['id'])
-        db.volume_type_destroy(self.context, vol_type['id'])
+
+    def test_too_many_gigabytes_of_type(self):
+        resource = 'gigabytes_%s' % self.volume_type_name
+        db.quota_class_create(self.context, 'default', resource, 10)
+        flag_args = {
+            'quota_volumes': 2000,
+            'quota_gigabytes': 2000,
+        }
+        self.flags(**flag_args)
+        vol_ref = self._create_volume(size=10)
+        self.assertRaises(exception.VolumeSizeExceedsAvailableQuota,
+                          volume.API().create,
+                          self.context, 1, '', '',
+                          volume_type=self.volume_type)
+        db.volume_destroy(self.context, vol_ref['id'])
 
 
 class FakeContext(object):
@@ -176,6 +228,10 @@ class FakeDriver(object):
             return self.by_class[quota_class][resource]
         except KeyError:
             raise exception.QuotaClassNotFound(class_name=quota_class)
+
+    def get_default(self, context, resource):
+        self.called.append(('get_default', context, resource))
+        return resource.default
 
     def get_defaults(self, context, resources):
         self.called.append(('get_defaults', context, resources))
@@ -308,24 +364,35 @@ class BaseResourceTestCase(test.TestCase):
         self.assertEqual(quota_value, 20)
 
 
+class VolumeTypeResourceTestCase(test.TestCase):
+    def test_name_and_flag(self):
+        volume_type_name = 'foo'
+        volume = {'name': volume_type_name, 'id': 'myid'}
+        resource = quota.VolumeTypeResource('volumes', volume)
+
+        self.assertEqual(resource.name, 'volumes_%s' % volume_type_name)
+        self.assertEqual(resource.flag, None)
+        self.assertEqual(resource.default, -1)
+
+
 class QuotaEngineTestCase(test.TestCase):
     def test_init(self):
         quota_obj = quota.QuotaEngine()
 
-        self.assertEqual(quota_obj._resources, {})
+        self.assertEqual(quota_obj.resources, {})
         self.assertTrue(isinstance(quota_obj._driver, quota.DbQuotaDriver))
 
     def test_init_override_string(self):
         quota_obj = quota.QuotaEngine(
             quota_driver_class='cinder.tests.test_quota.FakeDriver')
 
-        self.assertEqual(quota_obj._resources, {})
+        self.assertEqual(quota_obj.resources, {})
         self.assertTrue(isinstance(quota_obj._driver, FakeDriver))
 
     def test_init_override_obj(self):
         quota_obj = quota.QuotaEngine(quota_driver_class=FakeDriver)
 
-        self.assertEqual(quota_obj._resources, {})
+        self.assertEqual(quota_obj.resources, {})
         self.assertEqual(quota_obj._driver, FakeDriver)
 
     def test_register_resource(self):
@@ -333,7 +400,7 @@ class QuotaEngineTestCase(test.TestCase):
         resource = quota.AbsoluteResource('test_resource')
         quota_obj.register_resource(resource)
 
-        self.assertEqual(quota_obj._resources, dict(test_resource=resource))
+        self.assertEqual(quota_obj.resources, dict(test_resource=resource))
 
     def test_register_resources(self):
         quota_obj = quota.QuotaEngine()
@@ -343,39 +410,10 @@ class QuotaEngineTestCase(test.TestCase):
             quota.AbsoluteResource('test_resource3'), ]
         quota_obj.register_resources(resources)
 
-        self.assertEqual(quota_obj._resources,
+        self.assertEqual(quota_obj.resources,
                          dict(test_resource1=resources[0],
                               test_resource2=resources[1],
                               test_resource3=resources[2], ))
-
-    def test_sync_predeclared(self):
-        quota_obj = quota.QuotaEngine()
-
-        def spam(*args, **kwargs):
-            pass
-
-        resource = quota.ReservableResource('test_resource', spam)
-        quota_obj.register_resource(resource)
-
-        self.assertEqual(resource.sync, spam)
-
-    def test_sync_multi(self):
-        quota_obj = quota.QuotaEngine()
-
-        def spam(*args, **kwargs):
-            pass
-
-        resources = [
-            quota.ReservableResource('test_resource1', spam),
-            quota.ReservableResource('test_resource2', spam),
-            quota.ReservableResource('test_resource3', spam),
-            quota.ReservableResource('test_resource4', spam), ]
-        quota_obj.register_resources(resources[:2])
-
-        self.assertEqual(resources[0].sync, spam)
-        self.assertEqual(resources[1].sync, spam)
-        self.assertEqual(resources[2].sync, spam)
-        self.assertEqual(resources[3].sync, spam)
 
     def test_get_by_project(self):
         context = FakeContext('test_project', 'test_class')
@@ -426,8 +464,8 @@ class QuotaEngineTestCase(test.TestCase):
 
         self.assertEqual(driver.called, [('get_defaults',
                                           context,
-                                          quota_obj._resources), ])
-        self.assertEqual(result, quota_obj._resources)
+                                          quota_obj.resources), ])
+        self.assertEqual(result, quota_obj.resources)
 
     def test_get_class_quotas(self):
         context = FakeContext(None, None)
@@ -439,13 +477,13 @@ class QuotaEngineTestCase(test.TestCase):
         self.assertEqual(driver.called, [
             ('get_class_quotas',
              context,
-             quota_obj._resources,
+             quota_obj.resources,
              'test_class', True),
             ('get_class_quotas',
-             context, quota_obj._resources,
+             context, quota_obj.resources,
              'test_class', False), ])
-        self.assertEqual(result1, quota_obj._resources)
-        self.assertEqual(result2, quota_obj._resources)
+        self.assertEqual(result1, quota_obj.resources)
+        self.assertEqual(result2, quota_obj.resources)
 
     def test_get_project_quotas(self):
         context = FakeContext(None, None)
@@ -460,20 +498,20 @@ class QuotaEngineTestCase(test.TestCase):
         self.assertEqual(driver.called, [
             ('get_project_quotas',
              context,
-             quota_obj._resources,
+             quota_obj.resources,
              'test_project',
              None,
              True,
              True),
             ('get_project_quotas',
              context,
-             quota_obj._resources,
+             quota_obj.resources,
              'test_project',
              'test_class',
              False,
              False), ])
-        self.assertEqual(result1, quota_obj._resources)
-        self.assertEqual(result2, quota_obj._resources)
+        self.assertEqual(result1, quota_obj.resources)
+        self.assertEqual(result2, quota_obj.resources)
 
     def test_count_no_resource(self):
         context = FakeContext(None, None)
@@ -516,7 +554,7 @@ class QuotaEngineTestCase(test.TestCase):
         self.assertEqual(driver.called, [
             ('limit_check',
              context,
-             quota_obj._resources,
+             quota_obj.resources,
              dict(
                  test_resource1=4,
                  test_resource2=3,
@@ -544,7 +582,7 @@ class QuotaEngineTestCase(test.TestCase):
         self.assertEqual(driver.called, [
             ('reserve',
              context,
-             quota_obj._resources,
+             quota_obj.resources,
              dict(
                  test_resource1=4,
                  test_resource2=3,
@@ -554,7 +592,7 @@ class QuotaEngineTestCase(test.TestCase):
              None),
             ('reserve',
              context,
-             quota_obj._resources,
+             quota_obj.resources,
              dict(
                  test_resource1=1,
                  test_resource2=2,
@@ -564,7 +602,7 @@ class QuotaEngineTestCase(test.TestCase):
              None),
             ('reserve',
              context,
-             quota_obj._resources,
+             quota_obj.resources,
              dict(
                  test_resource1=1,
                  test_resource2=2,
@@ -632,12 +670,51 @@ class QuotaEngineTestCase(test.TestCase):
 
         self.assertEqual(driver.called, [('expire', context), ])
 
-    def test_resources(self):
+    def test_resource_names(self):
         quota_obj = self._make_quota_obj(None)
 
-        self.assertEqual(quota_obj.resources,
+        self.assertEqual(quota_obj.resource_names,
                          ['test_resource1', 'test_resource2',
                           'test_resource3', 'test_resource4'])
+
+
+class VolumeTypeQuotaEngineTestCase(test.TestCase):
+    def test_default_resources(self):
+        def fake_vtga(context, inactive=False, filters=None):
+            return {}
+        self.stubs.Set(db, 'volume_type_get_all', fake_vtga)
+
+        engine = quota.VolumeTypeQuotaEngine()
+        self.assertEqual(engine.resource_names,
+                         ['gigabytes', 'snapshots', 'volumes'])
+
+    def test_volume_type_resources(self):
+        ctx = context.RequestContext('admin', 'admin', is_admin=True)
+        vtype = db.volume_type_create(ctx, {'name': 'type1'})
+        vtype2 = db.volume_type_create(ctx, {'name': 'type_2'})
+
+        def fake_vtga(context, inactive=False, filters=None):
+            return {
+                'type1': {
+                    'id': vtype['id'],
+                    'name': 'type1',
+                    'extra_specs': {},
+                },
+                'type_2': {
+                    'id': vtype['id'],
+                    'name': 'type_2',
+                    'extra_specs': {},
+                },
+            }
+        self.stubs.Set(db, 'volume_type_get_all', fake_vtga)
+
+        engine = quota.VolumeTypeQuotaEngine()
+        self.assertEqual(engine.resource_names,
+                         ['gigabytes', 'gigabytes_type1', 'gigabytes_type_2',
+                          'snapshots', 'snapshots_type1', 'snapshots_type_2',
+                          'volumes', 'volumes_type1', 'volumes_type_2'])
+        db.volume_type_destroy(ctx, vtype['id'])
+        db.volume_type_destroy(ctx, vtype2['id'])
 
 
 class DbQuotaDriverTestCase(test.TestCase):
@@ -664,7 +741,9 @@ class DbQuotaDriverTestCase(test.TestCase):
 
     def test_get_defaults(self):
         # Use our pre-defined resources
-        result = self.driver.get_defaults(None, quota.QUOTAS._resources)
+        self._stub_quota_class_get_default()
+        self._stub_volume_type_get_all()
+        result = self.driver.get_defaults(None, quota.QUOTAS.resources)
 
         self.assertEqual(
             result,
@@ -672,6 +751,20 @@ class DbQuotaDriverTestCase(test.TestCase):
                 volumes=10,
                 snapshots=10,
                 gigabytes=1000, ))
+
+    def _stub_quota_class_get_default(self):
+        # Stub out quota_class_get_default
+        def fake_qcgd(context):
+            self.calls.append('quota_class_get_default')
+            return dict(volumes=10,
+                        snapshots=10,
+                        gigabytes=1000,)
+        self.stubs.Set(db, 'quota_class_get_default', fake_qcgd)
+
+    def _stub_volume_type_get_all(self):
+        def fake_vtga(context, inactive=False, filters=None):
+            return {}
+        self.stubs.Set(db, 'volume_type_get_all', fake_vtga)
 
     def _stub_quota_class_get_all_by_name(self):
         # Stub out quota_class_get_all_by_name
@@ -683,7 +776,8 @@ class DbQuotaDriverTestCase(test.TestCase):
 
     def test_get_class_quotas(self):
         self._stub_quota_class_get_all_by_name()
-        result = self.driver.get_class_quotas(None, quota.QUOTAS._resources,
+        self._stub_volume_type_get_all()
+        result = self.driver.get_class_quotas(None, quota.QUOTAS.resources,
                                               'test_class')
 
         self.assertEqual(self.calls, ['quota_class_get_all_by_name'])
@@ -693,7 +787,7 @@ class DbQuotaDriverTestCase(test.TestCase):
 
     def test_get_class_quotas_no_defaults(self):
         self._stub_quota_class_get_all_by_name()
-        result = self.driver.get_class_quotas(None, quota.QUOTAS._resources,
+        result = self.driver.get_class_quotas(None, quota.QUOTAS.resources,
                                               'test_class', False)
 
         self.assertEqual(self.calls, ['quota_class_get_all_by_name'])
@@ -718,16 +812,19 @@ class DbQuotaDriverTestCase(test.TestCase):
         self.stubs.Set(db, 'quota_usage_get_all_by_project', fake_qugabp)
 
         self._stub_quota_class_get_all_by_name()
+        self._stub_quota_class_get_default()
 
     def test_get_project_quotas(self):
         self._stub_get_by_project()
+        self._stub_volume_type_get_all()
         result = self.driver.get_project_quotas(
             FakeContext('test_project', 'test_class'),
-            quota.QUOTAS._resources, 'test_project')
+            quota.QUOTAS.resources, 'test_project')
 
         self.assertEqual(self.calls, ['quota_get_all_by_project',
                                       'quota_usage_get_all_by_project',
-                                      'quota_class_get_all_by_name', ])
+                                      'quota_class_get_all_by_name',
+                                      'quota_class_get_default', ])
         self.assertEqual(result, dict(volumes=dict(limit=10,
                                                    in_use=2,
                                                    reserved=0, ),
@@ -740,12 +837,14 @@ class DbQuotaDriverTestCase(test.TestCase):
 
     def test_get_project_quotas_alt_context_no_class(self):
         self._stub_get_by_project()
+        self._stub_volume_type_get_all()
         result = self.driver.get_project_quotas(
             FakeContext('other_project', 'other_class'),
-            quota.QUOTAS._resources, 'test_project')
+            quota.QUOTAS.resources, 'test_project')
 
         self.assertEqual(self.calls, ['quota_get_all_by_project',
-                                      'quota_usage_get_all_by_project', ])
+                                      'quota_usage_get_all_by_project',
+                                      'quota_class_get_default', ])
         self.assertEqual(result, dict(volumes=dict(limit=10,
                                                    in_use=2,
                                                    reserved=0, ),
@@ -758,13 +857,15 @@ class DbQuotaDriverTestCase(test.TestCase):
 
     def test_get_project_quotas_alt_context_with_class(self):
         self._stub_get_by_project()
+        self._stub_volume_type_get_all()
         result = self.driver.get_project_quotas(
             FakeContext('other_project', 'other_class'),
-            quota.QUOTAS._resources, 'test_project', quota_class='test_class')
+            quota.QUOTAS.resources, 'test_project', quota_class='test_class')
 
         self.assertEqual(self.calls, ['quota_get_all_by_project',
                                       'quota_usage_get_all_by_project',
-                                      'quota_class_get_all_by_name', ])
+                                      'quota_class_get_all_by_name',
+                                      'quota_class_get_default', ])
         self.assertEqual(result, dict(volumes=dict(limit=10,
                                                    in_use=2,
                                                    reserved=0, ),
@@ -777,13 +878,15 @@ class DbQuotaDriverTestCase(test.TestCase):
 
     def test_get_project_quotas_no_defaults(self):
         self._stub_get_by_project()
+        self._stub_volume_type_get_all()
         result = self.driver.get_project_quotas(
             FakeContext('test_project', 'test_class'),
-            quota.QUOTAS._resources, 'test_project', defaults=False)
+            quota.QUOTAS.resources, 'test_project', defaults=False)
 
         self.assertEqual(self.calls, ['quota_get_all_by_project',
                                       'quota_usage_get_all_by_project',
-                                      'quota_class_get_all_by_name', ])
+                                      'quota_class_get_all_by_name',
+                                      'quota_class_get_default', ])
         self.assertEqual(result,
                          dict(gigabytes=dict(limit=50,
                                              in_use=10,
@@ -797,12 +900,14 @@ class DbQuotaDriverTestCase(test.TestCase):
 
     def test_get_project_quotas_no_usages(self):
         self._stub_get_by_project()
+        self._stub_volume_type_get_all()
         result = self.driver.get_project_quotas(
             FakeContext('test_project', 'test_class'),
-            quota.QUOTAS._resources, 'test_project', usages=False)
+            quota.QUOTAS.resources, 'test_project', usages=False)
 
         self.assertEqual(self.calls, ['quota_get_all_by_project',
-                                      'quota_class_get_all_by_name', ])
+                                      'quota_class_get_all_by_name',
+                                      'quota_class_get_default', ])
         self.assertEqual(result, dict(volumes=dict(limit=10, ),
                                       snapshots=dict(limit=10, ),
                                       gigabytes=dict(limit=50, ), ))
@@ -822,7 +927,7 @@ class DbQuotaDriverTestCase(test.TestCase):
         self._stub_get_project_quotas()
         self.assertRaises(exception.QuotaResourceUnknown,
                           self.driver._get_quotas,
-                          None, quota.QUOTAS._resources,
+                          None, quota.QUOTAS.resources,
                           ['unknown'], True)
         self.assertEqual(self.calls, [])
 
@@ -830,7 +935,7 @@ class DbQuotaDriverTestCase(test.TestCase):
         self._stub_get_project_quotas()
         self.assertRaises(exception.QuotaResourceUnknown,
                           self.driver._get_quotas,
-                          None, quota.QUOTAS._resources,
+                          None, quota.QUOTAS.resources,
                           ['unknown'], False)
         self.assertEqual(self.calls, [])
 
@@ -838,7 +943,7 @@ class DbQuotaDriverTestCase(test.TestCase):
         self._stub_get_project_quotas()
         self.assertRaises(exception.QuotaResourceUnknown,
                           self.driver._get_quotas,
-                          None, quota.QUOTAS._resources,
+                          None, quota.QUOTAS.resources,
                           ['metadata_items'], True)
         self.assertEqual(self.calls, [])
 
@@ -846,7 +951,7 @@ class DbQuotaDriverTestCase(test.TestCase):
         self._stub_get_project_quotas()
         self.assertRaises(exception.QuotaResourceUnknown,
                           self.driver._get_quotas,
-                          None, quota.QUOTAS._resources,
+                          None, quota.QUOTAS.resources,
                           ['volumes'], False)
         self.assertEqual(self.calls, [])
 
@@ -854,7 +959,7 @@ class DbQuotaDriverTestCase(test.TestCase):
         self._stub_get_project_quotas()
         result = self.driver._get_quotas(FakeContext('test_project',
                                                      'test_class'),
-                                         quota.QUOTAS._resources,
+                                         quota.QUOTAS.resources,
                                          ['volumes', 'gigabytes'],
                                          True)
 
@@ -875,7 +980,7 @@ class DbQuotaDriverTestCase(test.TestCase):
         self.assertRaises(exception.InvalidReservationExpiration,
                           self.driver.reserve,
                           FakeContext('test_project', 'test_class'),
-                          quota.QUOTAS._resources,
+                          quota.QUOTAS.resources,
                           dict(volumes=2), expire='invalid')
         self.assertEqual(self.calls, [])
 
@@ -883,7 +988,7 @@ class DbQuotaDriverTestCase(test.TestCase):
         self._stub_get_project_quotas()
         self._stub_quota_reserve()
         result = self.driver.reserve(FakeContext('test_project', 'test_class'),
-                                     quota.QUOTAS._resources,
+                                     quota.QUOTAS.resources,
                                      dict(volumes=2))
 
         expire = timeutils.utcnow() + datetime.timedelta(seconds=86400)
@@ -895,7 +1000,7 @@ class DbQuotaDriverTestCase(test.TestCase):
         self._stub_get_project_quotas()
         self._stub_quota_reserve()
         result = self.driver.reserve(FakeContext('test_project', 'test_class'),
-                                     quota.QUOTAS._resources,
+                                     quota.QUOTAS.resources,
                                      dict(volumes=2), expire=3600)
 
         expire = timeutils.utcnow() + datetime.timedelta(seconds=3600)
@@ -908,7 +1013,7 @@ class DbQuotaDriverTestCase(test.TestCase):
         self._stub_quota_reserve()
         expire_delta = datetime.timedelta(seconds=60)
         result = self.driver.reserve(FakeContext('test_project', 'test_class'),
-                                     quota.QUOTAS._resources,
+                                     quota.QUOTAS.resources,
                                      dict(volumes=2), expire=expire_delta)
 
         expire = timeutils.utcnow() + expire_delta
@@ -921,7 +1026,7 @@ class DbQuotaDriverTestCase(test.TestCase):
         self._stub_quota_reserve()
         expire = timeutils.utcnow() + datetime.timedelta(seconds=120)
         result = self.driver.reserve(FakeContext('test_project', 'test_class'),
-                                     quota.QUOTAS._resources,
+                                     quota.QUOTAS.resources,
                                      dict(volumes=2), expire=expire)
 
         self.assertEqual(self.calls, ['get_project_quotas',
@@ -934,7 +1039,7 @@ class DbQuotaDriverTestCase(test.TestCase):
         self.flags(until_refresh=500)
         expire = timeutils.utcnow() + datetime.timedelta(seconds=120)
         result = self.driver.reserve(FakeContext('test_project', 'test_class'),
-                                     quota.QUOTAS._resources,
+                                     quota.QUOTAS.resources,
                                      dict(volumes=2), expire=expire)
 
         self.assertEqual(self.calls, ['get_project_quotas',
@@ -947,7 +1052,7 @@ class DbQuotaDriverTestCase(test.TestCase):
         self.flags(max_age=86400)
         expire = timeutils.utcnow() + datetime.timedelta(seconds=120)
         result = self.driver.reserve(FakeContext('test_project', 'test_class'),
-                                     quota.QUOTAS._resources,
+                                     quota.QUOTAS.resources,
                                      dict(volumes=2), expire=expire)
 
         self.assertEqual(self.calls, ['get_project_quotas',
@@ -997,7 +1102,8 @@ class QuotaReserveSqlAlchemyTestCase(test.TestCase):
         self.sync_called = set()
 
         def make_sync(res_name):
-            def sync(context, project_id, session):
+            def fake_sync(context, project_id, volume_type_id=None,
+                          volume_type_name=None, session=None):
                 self.sync_called.add(res_name)
                 if res_name in self.usages:
                     if self.usages[res_name].in_use < 0:
@@ -1005,13 +1111,16 @@ class QuotaReserveSqlAlchemyTestCase(test.TestCase):
                     else:
                         return {res_name: self.usages[res_name].in_use - 1}
                 return {res_name: 0}
-            return sync
+            return fake_sync
 
         self.resources = {}
+        QUOTA_SYNC_FUNCTIONS = {}
         for res_name in ('volumes', 'gigabytes'):
-            res = quota.ReservableResource(res_name, make_sync(res_name))
+            res = quota.ReservableResource(res_name, '_sync_%s' % res_name)
+            QUOTA_SYNC_FUNCTIONS['_sync_%s' % res_name] = make_sync(res_name)
             self.resources[res_name] = res
 
+        self.stubs.Set(sqa_api, 'QUOTA_SYNC_FUNCTIONS', QUOTA_SYNC_FUNCTIONS)
         self.expire = timeutils.utcnow() + datetime.timedelta(seconds=3600)
 
         self.usages = {}
@@ -1047,8 +1156,8 @@ class QuotaReserveSqlAlchemyTestCase(test.TestCase):
 
         self.stubs.Set(sqa_api, 'get_session', fake_get_session)
         self.stubs.Set(sqa_api, '_get_quota_usages', fake_get_quota_usages)
-        self.stubs.Set(sqa_api, 'quota_usage_create', fake_quota_usage_create)
-        self.stubs.Set(sqa_api, 'reservation_create', fake_reservation_create)
+        self.stubs.Set(sqa_api, '_quota_usage_create', fake_quota_usage_create)
+        self.stubs.Set(sqa_api, '_reservation_create', fake_reservation_create)
 
         timeutils.set_time_override()
 

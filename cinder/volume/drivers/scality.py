@@ -16,6 +16,7 @@
 Scality SOFS Volume Driver.
 """
 
+
 import errno
 import os
 import urllib2
@@ -24,10 +25,10 @@ import urlparse
 from oslo.config import cfg
 
 from cinder import exception
-from cinder import flags
 from cinder.image import image_utils
 from cinder.openstack.common import log as logging
 from cinder.volume import driver
+
 
 LOG = logging.getLogger(__name__)
 
@@ -43,8 +44,8 @@ volume_opts = [
                help='Path from Scality SOFS root to volume dir'),
 ]
 
-FLAGS = flags.FLAGS
-FLAGS.register_opts(volume_opts)
+CONF = cfg.CONF
+CONF.register_opts(volume_opts)
 
 
 class ScalityDriver(driver.VolumeDriver):
@@ -54,11 +55,13 @@ class ScalityDriver(driver.VolumeDriver):
     devices.
     """
 
+    VERSION = '1.0.0'
+
     def _check_prerequisites(self):
         """Sanity checks before attempting to mount SOFS."""
 
         # config is mandatory
-        config = FLAGS.scality_sofs_config
+        config = CONF.scality_sofs_config
         if not config:
             msg = _("Value required for 'scality_sofs_config'")
             LOG.warn(msg)
@@ -86,11 +89,11 @@ class ScalityDriver(driver.VolumeDriver):
             os.makedirs(path)
         except OSError as e:
             if e.errno != errno.EEXIST:
-                raise e
+                raise
 
     def _mount_sofs(self):
-        config = FLAGS.scality_sofs_config
-        mount_path = FLAGS.scality_sofs_mount_point
+        config = CONF.scality_sofs_config
+        mount_path = CONF.scality_sofs_mount_point
         sysdir = os.path.join(mount_path, 'sys')
 
         self._makedirs(mount_path)
@@ -110,7 +113,7 @@ class ScalityDriver(driver.VolumeDriver):
     def _create_file(self, path, size):
         with open(path, "ab") as f:
             f.truncate(size)
-        os.chmod(path, 0666)
+        os.chmod(path, 0o666)
 
     def _copy_file(self, src_path, dest_path):
         self._execute('dd', 'if=%s' % src_path, 'of=%s' % dest_path,
@@ -121,16 +124,16 @@ class ScalityDriver(driver.VolumeDriver):
         """Any initialization the volume driver does while starting."""
         self._check_prerequisites()
         self._mount_sofs()
-        voldir = os.path.join(FLAGS.scality_sofs_mount_point,
-                              FLAGS.scality_sofs_volume_dir)
+        voldir = os.path.join(CONF.scality_sofs_mount_point,
+                              CONF.scality_sofs_volume_dir)
         if not os.path.isdir(voldir):
             self._makedirs(voldir)
 
     def check_for_setup_error(self):
         """Returns an error if prerequisites aren't met."""
         self._check_prerequisites()
-        voldir = os.path.join(FLAGS.scality_sofs_mount_point,
-                              FLAGS.scality_sofs_volume_dir)
+        voldir = os.path.join(CONF.scality_sofs_mount_point,
+                              CONF.scality_sofs_volume_dir)
         if not os.path.isdir(voldir):
             msg = _("Cannot find volume dir for Scality SOFS at '%s'") % voldir
             LOG.warn(msg)
@@ -160,8 +163,8 @@ class ScalityDriver(driver.VolumeDriver):
 
     def create_snapshot(self, snapshot):
         """Creates a snapshot."""
-        volume_path = os.path.join(FLAGS.scality_sofs_mount_point,
-                                   FLAGS.scality_sofs_volume_dir,
+        volume_path = os.path.join(CONF.scality_sofs_mount_point,
+                                   CONF.scality_sofs_volume_dir,
                                    snapshot['volume_name'])
         snapshot_path = self.local_path(snapshot)
         self._create_file(snapshot_path,
@@ -173,11 +176,11 @@ class ScalityDriver(driver.VolumeDriver):
         os.remove(self.local_path(snapshot))
 
     def _sofs_path(self, volume):
-        return os.path.join(FLAGS.scality_sofs_volume_dir,
+        return os.path.join(CONF.scality_sofs_volume_dir,
                             volume['name'])
 
     def local_path(self, volume):
-        return os.path.join(FLAGS.scality_sofs_mount_point,
+        return os.path.join(CONF.scality_sofs_mount_point,
                             self._sofs_path(volume))
 
     def ensure_export(self, context, volume):
@@ -205,16 +208,12 @@ class ScalityDriver(driver.VolumeDriver):
             }
         }
 
-    def terminate_connection(self, volume, connector, force=False, **kwargs):
+    def terminate_connection(self, volume, connector, **kwargs):
         """Disallow connection from connector."""
         pass
 
-    def attach_volume(self, context, volume_id, instance_uuid, mountpoint):
-        """ Callback for volume attached to instance."""
-        pass
-
-    def detach_volume(self, context, volume_id):
-        """ Callback for volume detached."""
+    def detach_volume(self, context, volume):
+        """Callback for volume detached."""
         pass
 
     def get_volume_stats(self, refresh=False):
@@ -223,14 +222,15 @@ class ScalityDriver(driver.VolumeDriver):
         If 'refresh' is True, run the update first.
         """
         stats = {
-            'volume_backend_name': 'Scality_SOFS',
             'vendor_name': 'Scality',
-            'driver_version': '1.0',
+            'driver_version': self.VERSION,
             'storage_protocol': 'scality',
             'total_capacity_gb': 'infinite',
             'free_capacity_gb': 'infinite',
             'reserved_percentage': 0,
         }
+        backend_name = self.configuration.safe_get('volume_backend_name')
+        stats['volume_backend_name'] = backend_name or 'Scality_SOFS'
         return stats
 
     def copy_image_to_volume(self, context, volume, image_service, image_id):
@@ -248,13 +248,35 @@ class ScalityDriver(driver.VolumeDriver):
                                   image_meta,
                                   self.local_path(volume))
 
-    def clone_image(self, volume, image_location):
+    def clone_image(self, volume, image_location, image_id):
         """Create a volume efficiently from an existing image.
 
         image_location is a string whose format depends on the
         image service backend in use. The driver should use it
         to determine whether cloning is possible.
 
-        Returns a boolean indicating whether cloning occurred
+        image_id is a string which represents id of the image.
+        It can be used by the driver to introspect internal
+        stores or registry to do an efficient image clone.
+
+        Returns a dict of volume properties eg. provider_location,
+        boolean indicating whether cloning occurred
         """
-        return False
+        return None, False
+
+    def create_cloned_volume(self, volume, src_vref):
+        """Creates a clone of the specified volume."""
+        self.create_volume_from_snapshot(volume, src_vref)
+
+    def extend_volume(self, volume, new_size):
+        """Extend an existing volume."""
+        self._create_file(self.local_path(volume),
+                          self._size_bytes(new_size))
+
+    def backup_volume(self, context, backup, backup_service):
+        """Create a new backup from an existing volume."""
+        raise NotImplementedError()
+
+    def restore_backup(self, context, backup, volume, backup_service):
+        """Restore an existing backup to a new or existing volume."""
+        raise NotImplementedError()

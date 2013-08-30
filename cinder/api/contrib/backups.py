@@ -15,9 +15,9 @@
 
 """The backups api."""
 
+
 import webob
 from webob import exc
-from xml.dom import minidom
 
 from cinder.api import common
 from cinder.api import extensions
@@ -26,10 +26,10 @@ from cinder.api.views import backups as backup_views
 from cinder.api import xmlutil
 from cinder import backup as backupAPI
 from cinder import exception
-from cinder import flags
 from cinder.openstack.common import log as logging
+from cinder import utils
 
-FLAGS = flags.FLAGS
+
 LOG = logging.getLogger(__name__)
 
 
@@ -82,7 +82,7 @@ class BackupRestoreTemplate(xmlutil.TemplateBuilder):
 
 class CreateDeserializer(wsgi.MetadataXMLDeserializer):
     def default(self, string):
-        dom = minidom.parseString(string)
+        dom = utils.safe_minidom_parse_string(string)
         backup = self._extract_backup(dom)
         return {'body': {'backup': backup}}
 
@@ -101,7 +101,7 @@ class CreateDeserializer(wsgi.MetadataXMLDeserializer):
 
 class RestoreDeserializer(wsgi.MetadataXMLDeserializer):
     def default(self, string):
-        dom = minidom.parseString(string)
+        dom = utils.safe_minidom_parse_string(string)
         restore = self._extract_restore(dom)
         return {'body': {'restore': restore}}
 
@@ -131,7 +131,7 @@ class BackupsController(wsgi.Controller):
         try:
             backup = self.backup_api.get(context, backup_id=id)
         except exception.BackupNotFound as error:
-            raise exc.HTTPNotFound(explanation=unicode(error))
+            raise exc.HTTPNotFound(explanation=error.msg)
 
         return self._view_builder.detail(req, backup)
 
@@ -145,9 +145,9 @@ class BackupsController(wsgi.Controller):
         try:
             self.backup_api.delete(context, id)
         except exception.BackupNotFound as error:
-            raise exc.HTTPNotFound(explanation=unicode(error))
+            raise exc.HTTPNotFound(explanation=error.msg)
         except exception.InvalidBackup as error:
-            raise exc.HTTPBadRequest(explanation=unicode(error))
+            raise exc.HTTPBadRequest(explanation=error.msg)
 
         return webob.Response(status_int=202)
 
@@ -199,15 +199,19 @@ class BackupsController(wsgi.Controller):
         description = backup.get('description', None)
 
         LOG.audit(_("Creating backup of volume %(volume_id)s in container"
-                    " %(container)s"), locals(), context=context)
+                    " %(container)s"),
+                  {'volume_id': volume_id, 'container': container},
+                  context=context)
 
         try:
             new_backup = self.backup_api.create(context, name, description,
                                                 volume_id, container)
         except exception.InvalidVolume as error:
-            raise exc.HTTPBadRequest(explanation=unicode(error))
+            raise exc.HTTPBadRequest(explanation=error.msg)
         except exception.VolumeNotFound as error:
-            raise exc.HTTPNotFound(explanation=unicode(error))
+            raise exc.HTTPNotFound(explanation=error.msg)
+        except exception.ServiceNotFound as error:
+            raise exc.HTTPInternalServerError(explanation=error.msg)
 
         retval = self._view_builder.summary(req, dict(new_backup.iteritems()))
         return retval
@@ -217,8 +221,8 @@ class BackupsController(wsgi.Controller):
     @wsgi.deserializers(xml=RestoreDeserializer)
     def restore(self, req, id, body):
         """Restore an existing backup to a volume."""
-        backup_id = id
-        LOG.debug(_('Restoring backup %(backup_id)s (%(body)s)') % locals())
+        LOG.debug(_('Restoring backup %(backup_id)s (%(body)s)'),
+                  {'backup_id': id, 'body': body})
         if not self.is_valid_body(body, 'restore'):
             raise exc.HTTPBadRequest()
 
@@ -232,28 +236,29 @@ class BackupsController(wsgi.Controller):
         volume_id = restore.get('volume_id', None)
 
         LOG.audit(_("Restoring backup %(backup_id)s to volume %(volume_id)s"),
-                  locals(), context=context)
+                  {'backup_id': id, 'volume_id': volume_id},
+                  context=context)
 
         try:
             new_restore = self.backup_api.restore(context,
-                                                  backup_id=backup_id,
+                                                  backup_id=id,
                                                   volume_id=volume_id)
         except exception.InvalidInput as error:
-            raise exc.HTTPBadRequest(explanation=unicode(error))
+            raise exc.HTTPBadRequest(explanation=error.msg)
         except exception.InvalidVolume as error:
-            raise exc.HTTPBadRequest(explanation=unicode(error))
+            raise exc.HTTPBadRequest(explanation=error.msg)
         except exception.InvalidBackup as error:
-            raise exc.HTTPBadRequest(explanation=unicode(error))
+            raise exc.HTTPBadRequest(explanation=error.msg)
         except exception.BackupNotFound as error:
-            raise exc.HTTPNotFound(explanation=unicode(error))
+            raise exc.HTTPNotFound(explanation=error.msg)
         except exception.VolumeNotFound as error:
-            raise exc.HTTPNotFound(explanation=unicode(error))
+            raise exc.HTTPNotFound(explanation=error.msg)
         except exception.VolumeSizeExceedsAvailableQuota as error:
             raise exc.HTTPRequestEntityTooLarge(
-                explanation=error.message, headers={'Retry-After': 0})
+                explanation=error.msg, headers={'Retry-After': 0})
         except exception.VolumeLimitExceeded as error:
             raise exc.HTTPRequestEntityTooLarge(
-                explanation=error.message, headers={'Retry-After': 0})
+                explanation=error.msg, headers={'Retry-After': 0})
 
         retval = self._view_builder.restore_summary(
             req, dict(new_restore.iteritems()))

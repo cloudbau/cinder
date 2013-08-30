@@ -18,6 +18,7 @@
 
 import os
 
+from oslo.config import cfg
 import webob.dec
 import webob.exc
 
@@ -25,15 +26,14 @@ import cinder.api.openstack
 from cinder.api.openstack import wsgi
 from cinder.api import xmlutil
 from cinder import exception
-from cinder import flags
-from cinder.openstack.common import exception as common_exception
 from cinder.openstack.common import importutils
 from cinder.openstack.common import log as logging
 import cinder.policy
 
 
+CONF = cfg.CONF
+
 LOG = logging.getLogger(__name__)
-FLAGS = flags.FLAGS
 
 
 class ExtensionDescriptor(object):
@@ -183,7 +183,7 @@ class ExtensionManager(object):
     def __init__(self):
         LOG.audit(_('Initializing extension manager.'))
 
-        self.cls_list = FLAGS.osapi_volume_extension
+        self.cls_list = CONF.osapi_volume_extension
         self.extensions = {}
         self._load_extensions()
 
@@ -287,7 +287,8 @@ class ExtensionManager(object):
                 self.load_extension(ext_factory)
             except Exception as exc:
                 LOG.warn(_('Failed to load extension %(ext_factory)s: '
-                           '%(exc)s') % locals())
+                           '%(exc)s'),
+                         {'ext_factory': ext_factory, 'exc': exc})
 
 
 class ControllerExtension(object):
@@ -355,7 +356,8 @@ def load_standard_extensions(ext_mgr, logger, path, package, ext_list=None):
                 ext_mgr.load_extension(classpath)
             except Exception as exc:
                 logger.warn(_('Failed to load extension %(classpath)s: '
-                              '%(exc)s') % locals())
+                              '%(exc)s'),
+                            {'classpath': classpath, 'exc': exc})
 
         # Now, let's consider any subdirectories we may have...
         subdirs = []
@@ -370,7 +372,7 @@ def load_standard_extensions(ext_mgr, logger, path, package, ext_list=None):
                         (package, relpkg, dname))
             try:
                 ext = importutils.import_class(ext_name)
-            except common_exception.NotFound:
+            except ImportError:
                 # extension() doesn't exist on it, so we'll explore
                 # the directory for ourselves
                 subdirs.append(dname)
@@ -379,7 +381,8 @@ def load_standard_extensions(ext_mgr, logger, path, package, ext_list=None):
                     ext(ext_mgr)
                 except Exception as exc:
                     logger.warn(_('Failed to load extension %(ext_name)s: '
-                                  '%(exc)s') % locals())
+                                  '%(exc)s'),
+                                {'ext_name': ext_name, 'exc': exc})
 
         # Update the list of directories we'll explore...
         dirnames[:] = subdirs

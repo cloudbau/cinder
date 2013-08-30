@@ -18,8 +18,14 @@ Unit tests for the Scality SOFS Volume Driver.
 
 import errno
 import os
+import shutil
+import tempfile
 
+import mox as mox_lib
+
+from cinder import context
 from cinder import exception
+from cinder.image import image_utils
 from cinder import test
 from cinder import utils
 from cinder.volume.drivers import scality
@@ -52,12 +58,24 @@ class ScalityDriverTestCase(test.TestCase):
                                  TEST_VOLDIR,
                                  TEST_SNAPNAME)
 
+    TEST_CLONENAME = 'clone_name'
+    TEST_CLONE = {
+        'name': TEST_CLONENAME,
+        'size': TEST_VOLSIZE
+    }
+
+    TEST_NEWSIZE = '2'
+
+    TEST_IMAGE_SERVICE = 'image_service'
+    TEST_IMAGE_ID = 'image_id'
+    TEST_IMAGE_META = 'image_meta'
+
     def _makedirs(self, path):
         try:
             os.makedirs(path)
         except OSError as e:
             if e.errno != errno.EEXIST:
-                raise e
+                raise
 
     def _create_fake_config(self):
         open(self.TEST_CONFIG, "w+").close()
@@ -66,20 +84,17 @@ class ScalityDriverTestCase(test.TestCase):
         self._makedirs(os.path.join(self.TEST_MOUNT, 'sys'))
         self._makedirs(os.path.join(self.TEST_MOUNT, self.TEST_VOLDIR))
 
-    def _remove_fake_mount(self):
-        utils.execute('rm', '-rf', self.TEST_MOUNT)
-
     def _remove_fake_config(self):
         try:
             os.unlink(self.TEST_CONFIG)
         except OSError as e:
             if e.errno != errno.ENOENT:
-                raise e
+                raise
 
     def _configure_driver(self):
-        scality.FLAGS.scality_sofs_config = self.TEST_CONFIG
-        scality.FLAGS.scality_sofs_mount_point = self.TEST_MOUNT
-        scality.FLAGS.scality_sofs_volume_dir = self.TEST_VOLDIR
+        scality.CONF.scality_sofs_config = self.TEST_CONFIG
+        scality.CONF.scality_sofs_mount_point = self.TEST_MOUNT
+        scality.CONF.scality_sofs_volume_dir = self.TEST_VOLDIR
 
     def _execute_wrapper(self, cmd, *args, **kwargs):
         try:
@@ -101,28 +116,41 @@ class ScalityDriverTestCase(test.TestCase):
     def setUp(self):
         super(ScalityDriverTestCase, self).setUp()
 
-        self._remove_fake_mount()
+        self.tempdir = tempfile.mkdtemp()
+
+        self.TEST_MOUNT = self.tempdir
+        self.TEST_VOLPATH = os.path.join(self.TEST_MOUNT,
+                                         self.TEST_VOLDIR,
+                                         self.TEST_VOLNAME)
+        self.TEST_SNAPPATH = os.path.join(self.TEST_MOUNT,
+                                          self.TEST_VOLDIR,
+                                          self.TEST_SNAPNAME)
+        self.TEST_CLONEPATH = os.path.join(self.TEST_MOUNT,
+                                           self.TEST_VOLDIR,
+                                           self.TEST_CLONENAME)
+
         self._driver = scality.ScalityDriver()
         self._driver.set_execute(self._execute_wrapper)
+        self._mox = mox_lib.Mox()
 
         self._create_fake_mount()
         self._create_fake_config()
         self._configure_driver()
 
     def tearDown(self):
-        self._remove_fake_mount()
+        shutil.rmtree(self.tempdir)
         self._remove_fake_config()
         super(ScalityDriverTestCase, self).tearDown()
 
     def test_setup_no_config(self):
         """Missing SOFS configuration shall raise an error."""
-        scality.FLAGS.scality_sofs_config = None
+        scality.CONF.scality_sofs_config = None
         self.assertRaises(exception.VolumeBackendAPIException,
                           self._driver.do_setup, None)
 
     def test_setup_missing_config(self):
         """Non-existent SOFS configuration file shall raise an error."""
-        scality.FLAGS.scality_sofs_config = 'nonexistent.conf'
+        scality.CONF.scality_sofs_config = 'nonexistent.conf'
         self.assertRaises(exception.VolumeBackendAPIException,
                           self._driver.do_setup, None)
 
@@ -163,18 +191,35 @@ class ScalityDriverTestCase(test.TestCase):
 
     def test_create_snapshot(self):
         """Expected behaviour for create_snapshot."""
-        self._driver.create_volume(self.TEST_VOLUME)
+        mox = self._mox
+
+        vol_size = self._driver._size_bytes(self.TEST_VOLSIZE)
+
+        mox.StubOutWithMock(self._driver, '_create_file')
+        self._driver._create_file(self.TEST_SNAPPATH, vol_size)
+        mox.StubOutWithMock(self._driver, '_copy_file')
+        self._driver._copy_file(self.TEST_VOLPATH, self.TEST_SNAPPATH)
+
+        mox.ReplayAll()
+
         self._driver.create_snapshot(self.TEST_SNAPSHOT)
-        self.assertTrue(os.path.isfile(self.TEST_SNAPPATH))
-        self.assertEqual(os.stat(self.TEST_SNAPPATH).st_size,
-                         100 * 1024 * 1024)
+
+        mox.UnsetStubs()
+        mox.VerifyAll()
 
     def test_delete_snapshot(self):
         """Expected behaviour for delete_snapshot."""
-        self._driver.create_volume(self.TEST_VOLUME)
-        self._driver.create_snapshot(self.TEST_SNAPSHOT)
+        mox = self._mox
+
+        mox.StubOutWithMock(os, 'remove')
+        os.remove(self.TEST_SNAPPATH)
+
+        mox.ReplayAll()
+
         self._driver.delete_snapshot(self.TEST_SNAPSHOT)
-        self.assertFalse(os.path.isfile(self.TEST_SNAPPATH))
+
+        mox.UnsetStubs()
+        mox.VerifyAll()
 
     def test_initialize_connection(self):
         """Expected behaviour for initialize_connection."""
@@ -183,3 +228,59 @@ class ScalityDriverTestCase(test.TestCase):
         self.assertEqual(ret['data']['sofs_path'],
                          os.path.join(self.TEST_VOLDIR,
                                       self.TEST_VOLNAME))
+
+    def test_copy_image_to_volume(self):
+        """Expected behaviour for copy_image_to_volume."""
+        self.mox.StubOutWithMock(image_utils, 'fetch_to_raw')
+
+        image_utils.fetch_to_raw(context,
+                                 self.TEST_IMAGE_SERVICE,
+                                 self.TEST_IMAGE_ID,
+                                 self.TEST_VOLPATH)
+
+        self.mox.ReplayAll()
+
+        self._driver.copy_image_to_volume(context,
+                                          self.TEST_VOLUME,
+                                          self.TEST_IMAGE_SERVICE,
+                                          self.TEST_IMAGE_ID)
+
+    def test_copy_volume_to_image(self):
+        """Expected behaviour for copy_volume_to_image."""
+        self.mox.StubOutWithMock(image_utils, 'upload_volume')
+
+        image_utils.upload_volume(context,
+                                  self.TEST_IMAGE_SERVICE,
+                                  self.TEST_IMAGE_META,
+                                  self.TEST_VOLPATH)
+
+        self.mox.ReplayAll()
+
+        self._driver.copy_volume_to_image(context,
+                                          self.TEST_VOLUME,
+                                          self.TEST_IMAGE_SERVICE,
+                                          self.TEST_IMAGE_META)
+
+    def test_create_cloned_volume(self):
+        """Expected behaviour for create_cloned_volume."""
+        self.mox.StubOutWithMock(self._driver, '_create_file')
+        self.mox.StubOutWithMock(self._driver, '_copy_file')
+
+        vol_size = self._driver._size_bytes(self.TEST_VOLSIZE)
+        self._driver._create_file(self.TEST_CLONEPATH, vol_size)
+        self._driver._copy_file(self.TEST_VOLPATH, self.TEST_CLONEPATH)
+
+        self.mox.ReplayAll()
+
+        self._driver.create_cloned_volume(self.TEST_CLONE, self.TEST_VOLUME)
+
+    def test_extend_volume(self):
+        """Expected behaviour for extend_volume."""
+        self.mox.StubOutWithMock(self._driver, '_create_file')
+
+        new_size = self._driver._size_bytes(self.TEST_NEWSIZE)
+        self._driver._create_file(self.TEST_VOLPATH, new_size)
+
+        self.mox.ReplayAll()
+
+        self._driver.extend_volume(self.TEST_VOLUME, self.TEST_NEWSIZE)

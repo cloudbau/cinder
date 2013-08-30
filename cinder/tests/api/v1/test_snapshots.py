@@ -21,7 +21,6 @@ import webob
 from cinder.api.v1 import snapshots
 from cinder import db
 from cinder import exception
-from cinder import flags
 from cinder.openstack.common import log as logging
 from cinder import test
 from cinder.tests.api import fakes
@@ -29,7 +28,6 @@ from cinder.tests.api.v1 import stubs
 from cinder import volume
 
 
-FLAGS = flags.FLAGS
 LOG = logging.getLogger(__name__)
 
 UUID = '00000000-0000-0000-0000-000000000001'
@@ -316,6 +314,32 @@ class SnapshotApiTest(test.TestCase):
         self.assertTrue('snapshots' in res)
         self.assertEqual(1, len(res['snapshots']))
 
+    def test_list_snapshots_with_limit_and_offset(self):
+        def list_snapshots_with_limit_and_offset(is_admin):
+            def stub_snapshot_get_all_by_project(context, project_id):
+                return [
+                    stubs.stub_snapshot(1, display_name='backup1'),
+                    stubs.stub_snapshot(2, display_name='backup2'),
+                    stubs.stub_snapshot(3, display_name='backup3'),
+                ]
+
+            self.stubs.Set(db, 'snapshot_get_all_by_project',
+                           stub_snapshot_get_all_by_project)
+
+            req = fakes.HTTPRequest.blank('/v1/fake/snapshots?limit=1\
+                                          &offset=1',
+                                          use_admin_context=is_admin)
+            res = self.controller.index(req)
+
+            self.assertTrue('snapshots' in res)
+            self.assertEqual(1, len(res['snapshots']))
+            self.assertEqual(2, res['snapshots'][0]['id'])
+
+        #admin case
+        list_snapshots_with_limit_and_offset(is_admin=True)
+        #non_admin case
+        list_snapshots_with_limit_and_offset(is_admin=False)
+
     def test_admin_list_snapshots_all_tenants(self):
         req = fakes.HTTPRequest.blank('/v1/fake/snapshots?all_tenants=1',
                                       use_admin_context=True)
@@ -356,7 +380,6 @@ class SnapshotSerializerTest(test.TestCase):
             volume_id='vol_id', )
         text = serializer.serialize(dict(snapshot=raw_snapshot))
 
-        print text
         tree = etree.fromstring(text)
 
         self._verify_snapshot(raw_snapshot, tree)
@@ -379,7 +402,6 @@ class SnapshotSerializerTest(test.TestCase):
                               volume_id='vol2_id', )]
         text = serializer.serialize(dict(snapshots=raw_snapshots))
 
-        print text
         tree = etree.fromstring(text)
 
         self.assertEqual('snapshots', tree.tag)

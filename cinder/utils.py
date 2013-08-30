@@ -19,28 +19,20 @@
 
 """Utilities and helper functions."""
 
+
 import contextlib
 import datetime
-import errno
 import functools
 import hashlib
 import inspect
-import itertools
 import os
-import paramiko
 import pyclbr
 import random
 import re
-import shlex
 import shutil
-import signal
-import socket
-import struct
 import sys
 import tempfile
 import time
-import types
-import warnings
 from xml.dom import minidom
 from xml.parsers import expat
 from xml import sax
@@ -48,22 +40,28 @@ from xml.sax import expatreader
 from xml.sax import saxutils
 
 from eventlet import event
-from eventlet.green import subprocess
 from eventlet import greenthread
 from eventlet import pools
+from oslo.config import cfg
+import paramiko
 
+from cinder.brick.initiator import connector
 from cinder import exception
-from cinder import flags
 from cinder.openstack.common import excutils
+from cinder.openstack.common import gettextutils
 from cinder.openstack.common import importutils
+from cinder.openstack.common import lockutils
 from cinder.openstack.common import log as logging
+from cinder.openstack.common import processutils
 from cinder.openstack.common import timeutils
 
 
+CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 ISO_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 PERFECT_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
-FLAGS = flags.FLAGS
+
+synchronized = lockutils.synchronized_with_prefix('cinder-')
 
 
 def find_config(config_path):
@@ -76,9 +74,9 @@ def find_config(config_path):
     """
     possible_locations = [
         config_path,
-        os.path.join(FLAGS.state_path, "etc", "cinder", config_path),
-        os.path.join(FLAGS.state_path, "etc", config_path),
-        os.path.join(FLAGS.state_path, config_path),
+        os.path.join(CONF.state_path, "etc", "cinder", config_path),
+        os.path.join(CONF.state_path, "etc", config_path),
+        os.path.join(CONF.state_path, config_path),
         "/etc/cinder/%s" % config_path,
     ]
 
@@ -89,186 +87,90 @@ def find_config(config_path):
     raise exception.ConfigNotFound(path=os.path.abspath(config_path))
 
 
-def fetchfile(url, target):
-    LOG.debug(_('Fetching %s') % url)
-    execute('curl', '--fail', url, '-o', target)
+def as_int(obj, quiet=True):
+    # Try "2" -> 2
+    try:
+        return int(obj)
+    except (ValueError, TypeError):
+        pass
+    # Try "2.5" -> 2
+    try:
+        return int(float(obj))
+    except (ValueError, TypeError):
+        pass
+    # Eck, not sure what this is then.
+    if not quiet:
+        raise TypeError(_("Can not translate %s to integer.") % (obj))
+    return obj
 
 
-def _subprocess_setup():
-    # Python installs a SIGPIPE handler by default. This is usually not what
-    # non-Python subprocesses expect.
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+def check_exclusive_options(**kwargs):
+    """Checks that only one of the provided options is actually not-none.
+
+    Iterates over all the kwargs passed in and checks that only one of said
+    arguments is not-none, if more than one is not-none then an exception will
+    be raised with the names of those arguments who were not-none.
+    """
+
+    if not kwargs:
+        return
+
+    pretty_keys = kwargs.pop("pretty_keys", True)
+    exclusive_options = {}
+    for (k, v) in kwargs.iteritems():
+        if v is not None:
+            exclusive_options[k] = True
+
+    if len(exclusive_options) > 1:
+        # Change the format of the names from pythonic to
+        # something that is more readable.
+        #
+        # Ex: 'the_key' -> 'the key'
+        if pretty_keys:
+            names = [k.replace('_', ' ') for k in kwargs.keys()]
+        else:
+            names = kwargs.keys()
+        names = ", ".join(sorted(names))
+        msg = (_("May specify only one of %s") % (names))
+        raise exception.InvalidInput(reason=msg)
 
 
 def execute(*cmd, **kwargs):
-    """Helper method to execute command with optional retry.
-
-    If you add a run_as_root=True command, don't forget to add the
-    corresponding filter to etc/cinder/rootwrap.d !
-
-    :param cmd:                Passed to subprocess.Popen.
-    :param process_input:      Send to opened process.
-    :param check_exit_code:    Single bool, int, or list of allowed exit
-                               codes.  Defaults to [0].  Raise
-                               exception.ProcessExecutionError unless
-                               program exits with one of these code.
-    :param delay_on_retry:     True | False. Defaults to True. If set to
-                               True, wait a short amount of time
-                               before retrying.
-    :param attempts:           How many times to retry cmd.
-    :param run_as_root:        True | False. Defaults to False. If set to True,
-                               the command is prefixed by the command specified
-                               in the root_helper FLAG.
-
-    :raises exception.Error: on receiving unknown arguments
-    :raises exception.ProcessExecutionError:
-
-    :returns: a tuple, (stdout, stderr) from the spawned process, or None if
-             the command fails.
-    """
-
-    process_input = kwargs.pop('process_input', None)
-    check_exit_code = kwargs.pop('check_exit_code', [0])
-    ignore_exit_code = False
-    if isinstance(check_exit_code, bool):
-        ignore_exit_code = not check_exit_code
-        check_exit_code = [0]
-    elif isinstance(check_exit_code, int):
-        check_exit_code = [check_exit_code]
-    delay_on_retry = kwargs.pop('delay_on_retry', True)
-    attempts = kwargs.pop('attempts', 1)
-    run_as_root = kwargs.pop('run_as_root', False)
-    shell = kwargs.pop('shell', False)
-
-    if len(kwargs):
-        raise exception.Error(_('Got unknown keyword args '
-                                'to utils.execute: %r') % kwargs)
-
-    if run_as_root:
-
-        if FLAGS.rootwrap_config is None or FLAGS.root_helper != 'sudo':
-            LOG.deprecated(_('The root_helper option (which lets you specify '
-                             'a root wrapper different from cinder-rootwrap, '
-                             'and defaults to using sudo) is now deprecated. '
-                             'You should use the rootwrap_config option '
-                             'instead.'))
-
-        if (FLAGS.rootwrap_config is not None):
-            cmd = ['sudo', 'cinder-rootwrap',
-                   FLAGS.rootwrap_config] + list(cmd)
-        else:
-            cmd = shlex.split(FLAGS.root_helper) + list(cmd)
-    cmd = map(str, cmd)
-
-    while attempts > 0:
-        attempts -= 1
-        try:
-            LOG.debug(_('Running cmd (subprocess): %s'), ' '.join(cmd))
-            _PIPE = subprocess.PIPE  # pylint: disable=E1101
-            obj = subprocess.Popen(cmd,
-                                   stdin=_PIPE,
-                                   stdout=_PIPE,
-                                   stderr=_PIPE,
-                                   close_fds=True,
-                                   preexec_fn=_subprocess_setup,
-                                   shell=shell)
-            result = None
-            if process_input is not None:
-                result = obj.communicate(process_input)
-            else:
-                result = obj.communicate()
-            obj.stdin.close()  # pylint: disable=E1101
-            _returncode = obj.returncode  # pylint: disable=E1101
-            if _returncode:
-                LOG.debug(_('Result was %s') % _returncode)
-                if not ignore_exit_code and _returncode not in check_exit_code:
-                    (stdout, stderr) = result
-                    raise exception.ProcessExecutionError(
-                        exit_code=_returncode,
-                        stdout=stdout,
-                        stderr=stderr,
-                        cmd=' '.join(cmd))
-            return result
-        except exception.ProcessExecutionError:
-            if not attempts:
-                raise
-            else:
-                LOG.debug(_('%r failed. Retrying.'), cmd)
-                if delay_on_retry:
-                    greenthread.sleep(random.randint(20, 200) / 100.0)
-        finally:
-            # NOTE(termie): this appears to be necessary to let the subprocess
-            #               call clean something up in between calls, without
-            #               it two execute calls in a row hangs the second one
-            greenthread.sleep(0)
+    """Convenience wrapper around oslo's execute() method."""
+    if 'run_as_root' in kwargs and not 'root_helper' in kwargs:
+        kwargs['root_helper'] = get_root_helper()
+    return processutils.execute(*cmd, **kwargs)
 
 
-def trycmd(*args, **kwargs):
-    """
-    A wrapper around execute() to more easily handle warnings and errors.
+def check_ssh_injection(cmd_list):
+    ssh_injection_pattern = ['`', '$', '|', '||', ';', '&', '&&', '>', '>>',
+                             '<']
 
-    Returns an (out, err) tuple of strings containing the output of
-    the command's stdout and stderr.  If 'err' is not empty then the
-    command can be considered to have failed.
+    # Check whether injection attacks exist
+    for arg in cmd_list:
+        arg = arg.strip()
+        # First, check no space in the middle of arg
+        arg_len = len(arg.split())
+        if arg_len > 1:
+            raise exception.SSHInjectionThreat(command=str(cmd_list))
 
-    :discard_warnings   True | False. Defaults to False. If set to True,
-                        then for succeeding commands, stderr is cleared
+        # Second, check whether danger character in command. So the shell
+        # special operator must be a single argument.
+        for c in ssh_injection_pattern:
+            if arg == c:
+                continue
 
-    """
-    discard_warnings = kwargs.pop('discard_warnings', False)
-
-    try:
-        out, err = execute(*args, **kwargs)
-        failed = False
-    except exception.ProcessExecutionError, exn:
-        out, err = '', str(exn)
-        LOG.debug(err)
-        failed = True
-
-    if not failed and discard_warnings and err:
-        # Handle commands that output to stderr but otherwise succeed
-        LOG.debug(err)
-        err = ''
-
-    return out, err
+            result = arg.find(c)
+            if not result == -1:
+                if result == 0 or not arg[result - 1] == '\\':
+                    raise exception.SSHInjectionThreat(command=cmd_list)
 
 
-def ssh_execute(ssh, cmd, process_input=None,
-                addl_env=None, check_exit_code=True):
-    LOG.debug(_('Running cmd (SSH): %s'), cmd)
-    if addl_env:
-        raise exception.Error(_('Environment not supported over SSH'))
-
-    if process_input:
-        # This is (probably) fixable if we need it...
-        raise exception.Error(_('process_input not supported over SSH'))
-
-    stdin_stream, stdout_stream, stderr_stream = ssh.exec_command(cmd)
-    channel = stdout_stream.channel
-
-    #stdin.write('process_input would go here')
-    #stdin.flush()
-
-    # NOTE(justinsb): This seems suspicious...
-    # ...other SSH clients have buffering issues with this approach
-    stdout = stdout_stream.read()
-    stderr = stderr_stream.read()
-    stdin_stream.close()
-    stdout_stream.close()
-    stderr_stream.close()
-
-    exit_status = channel.recv_exit_status()
-
-    # exit_status == -1 if no exit code was returned
-    if exit_status != -1:
-        LOG.debug(_('Result was %s') % exit_status)
-        if check_exit_code and exit_status != 0:
-            raise exception.ProcessExecutionError(exit_code=exit_status,
-                                                  stdout=stdout,
-                                                  stderr=stderr,
-                                                  cmd=cmd)
-    channel.close()
-    return (stdout, stderr)
+def create_channel(client, width, height):
+    """Invoke an interactive shell session on server."""
+    channel = client.invoke_shell()
+    channel.resize_pty(width, height)
+    return channel
 
 
 class SSHPool(pools.Pool):
@@ -330,35 +232,27 @@ class SSHPool(pools.Pool):
         before returning it. For dead connections create and return a new
         connection.
         """
-        if self.free_items:
-            conn = self.free_items.popleft()
-            if conn:
-                if conn.get_transport().is_active():
-                    return conn
-                else:
-                    conn.close()
-            return self.create()
-        if self.current_size < self.max_size:
-            created = self.create()
-            self.current_size += 1
-            return created
-        return self.channel.get()
+        conn = super(SSHPool, self).get()
+        if conn:
+            if conn.get_transport().is_active():
+                return conn
+            else:
+                conn.close()
+        return self.create()
+
+    def remove(self, ssh):
+        """Close an ssh client and remove it from free_items."""
+        ssh.close()
+        ssh = None
+        if ssh in self.free_items:
+            self.free_items.pop(ssh)
+        if self.current_size > 0:
+            self.current_size -= 1
 
 
 def cinderdir():
     import cinder
     return os.path.abspath(cinder.__file__).split('cinder/__init__.py')[0]
-
-
-def debug(arg):
-    LOG.debug(_('debug in callback: %s'), arg)
-    return arg
-
-
-def generate_uid(topic, size=8):
-    characters = '01234567890abcdefghijklmnopqrstuvwxyz'
-    choices = [random.choice(characters) for x in xrange(size)]
-    return '%s-%s' % (topic, ''.join(choices))
 
 
 # Default symbols to use for passwords. Avoids visually confusing characters.
@@ -389,9 +283,10 @@ def last_completed_audit_period(unit=None):
 
     returns:  2 tuple of datetimes (begin, end)
               The begin timestamp of this audit period is the same as the
-              end of the previous."""
+              end of the previous.
+    """
     if not unit:
-        unit = FLAGS.volume_usage_audit_period
+        unit = CONF.volume_usage_audit_period
 
     offset = 0
     if '@' in unit:
@@ -497,44 +392,6 @@ def generate_username(length=20, symbolgroups=DEFAULT_PASSWORD_SYMBOLS):
     return generate_password(length, symbolgroups)
 
 
-def last_octet(address):
-    return int(address.split('.')[-1])
-
-
-def get_my_linklocal(interface):
-    try:
-        if_str = execute('ip', '-f', 'inet6', '-o', 'addr', 'show', interface)
-        condition = '\s+inet6\s+([0-9a-f:]+)/\d+\s+scope\s+link'
-        links = [re.search(condition, x) for x in if_str[0].split('\n')]
-        address = [w.group(1) for w in links if w is not None]
-        if address[0] is not None:
-            return address[0]
-        else:
-            raise exception.Error(_('Link Local address is not found.:%s')
-                                  % if_str)
-    except Exception as ex:
-        raise exception.Error(_("Couldn't get Link Local IP of %(interface)s"
-                                " :%(ex)s") % locals())
-
-
-def parse_mailmap(mailmap='.mailmap'):
-    mapping = {}
-    if os.path.exists(mailmap):
-        fp = open(mailmap, 'r')
-        for l in fp:
-            l = l.strip()
-            if not l.startswith('#') and ' ' in l:
-                canonical_email, alias = l.split(' ')
-                mapping[alias.lower()] = canonical_email.lower()
-    return mapping
-
-
-def str_dict_replace(s, mapping):
-    for s1, s2 in mapping.iteritems():
-        s = s.replace(s1, s2)
-    return s
-
-
 class LazyPluggable(object):
     """A pluggable backend loaded lazily based on some value."""
 
@@ -545,7 +402,7 @@ class LazyPluggable(object):
 
     def __get_backend(self):
         if not self.__backend:
-            backend_name = FLAGS[self.__pivot]
+            backend_name = CONF[self.__pivot]
             if backend_name not in self.__backends:
                 raise exception.Error(_('Invalid backend: %s') % backend_name)
 
@@ -604,7 +461,7 @@ class LoopingCall(object):
                     if not self._running:
                         break
                     greenthread.sleep(interval)
-            except LoopingCallDone, e:
+            except LoopingCallDone as e:
                 self.stop()
                 done.send(e.retvalue)
             except Exception:
@@ -673,36 +530,11 @@ def xhtml_escape(value):
     return saxutils.escape(value, {'"': '&quot;', "'": '&apos;'})
 
 
-def utf8(value):
-    """Try to turn a string into utf-8 if possible.
-
-    Code is directly from the utf8 function in
-    http://github.com/facebook/tornado/blob/master/tornado/escape.py
-
-    """
-    if isinstance(value, unicode):
-        return value.encode('utf-8')
-    assert isinstance(value, str)
-    return value
-
-
-def delete_if_exists(pathname):
-    """delete a file, but ignore file not found error"""
-
-    try:
-        os.unlink(pathname)
-    except OSError as e:
-        if e.errno == errno.ENOENT:
-            return
-        else:
-            raise
-
-
 def get_from_path(items, path):
     """Returns a list of items matching the specified path.
 
     Takes an XPath-like expression e.g. prop1/prop2/prop3, and for each item
-    in items, looks up items[prop1][prop2][prop3].  Like XPath, if any of the
+    in items, looks up items[prop1][prop2][prop3]. Like XPath, if any of the
     intermediate results are lists it will treat each list item individually.
     A 'None' in items or any child expressions will be ignored, this function
     will not throw because of None (anywhere) in items.  The returned list
@@ -749,66 +581,8 @@ def get_from_path(items, path):
         return get_from_path(results, remainder)
 
 
-def flatten_dict(dict_, flattened=None):
-    """Recursively flatten a nested dictionary."""
-    flattened = flattened or {}
-    for key, value in dict_.iteritems():
-        if hasattr(value, 'iteritems'):
-            flatten_dict(value, flattened)
-        else:
-            flattened[key] = value
-    return flattened
-
-
-def partition_dict(dict_, keys):
-    """Return two dicts, one with `keys` the other with everything else."""
-    intersection = {}
-    difference = {}
-    for key, value in dict_.iteritems():
-        if key in keys:
-            intersection[key] = value
-        else:
-            difference[key] = value
-    return intersection, difference
-
-
-def map_dict_keys(dict_, key_map):
-    """Return a dict in which the dictionaries keys are mapped to new keys."""
-    mapped = {}
-    for key, value in dict_.iteritems():
-        mapped_key = key_map[key] if key in key_map else key
-        mapped[mapped_key] = value
-    return mapped
-
-
-def subset_dict(dict_, keys):
-    """Return a dict that only contains a subset of keys."""
-    subset = partition_dict(dict_, keys)[0]
-    return subset
-
-
-def check_isinstance(obj, cls):
-    """Checks that obj is of type cls, and lets PyLint infer types."""
-    if isinstance(obj, cls):
-        return obj
-    raise Exception(_('Expected object of type: %s') % (str(cls)))
-    # TODO(justinsb): Can we make this better??
-    return cls()  # Ugly PyLint hack
-
-
-def bool_from_str(val):
-    """Convert a string representation of a bool into a bool value"""
-
-    if not val:
-        return False
-    try:
-        return True if int(val) else False
-    except ValueError:
-        return val.lower() == 'true'
-
-
 def is_valid_boolstr(val):
-    """Check if the provided string is a valid bool string or not. """
+    """Check if the provided string is a valid bool string or not."""
     val = str(val).lower()
     return (val == 'true' or val == 'false' or
             val == 'yes' or val == 'no' or
@@ -816,28 +590,13 @@ def is_valid_boolstr(val):
             val == '1' or val == '0')
 
 
-def is_valid_ipv4(address):
-    """valid the address strictly as per format xxx.xxx.xxx.xxx.
-    where xxx is a value between 0 and 255.
-    """
-    parts = address.split(".")
-    if len(parts) != 4:
-        return False
-    for item in parts:
-        try:
-            if not 0 <= int(item) <= 255:
-                return False
-        except ValueError:
-            return False
-    return True
-
-
 def monkey_patch():
-    """  If the Flags.monkey_patch set as True,
+    """If the CONF.monkey_patch set as True,
     this function patches a decorator
     for all functions in specified modules.
+
     You can set decorators for each modules
-    using FLAGS.monkey_patch_modules.
+    using CONF.monkey_patch_modules.
     The format is "Module path:Decorator function".
     Example: 'cinder.api.ec2.cloud:' \
      cinder.openstack.common.notifier.api.notify_decorator'
@@ -848,11 +607,11 @@ def monkey_patch():
     name - name of the function
     function - object of the function
     """
-    # If FLAGS.monkey_patch is not True, this function do nothing.
-    if not FLAGS.monkey_patch:
+    # If CONF.monkey_patch is not True, this function do nothing.
+    if not CONF.monkey_patch:
         return
     # Get list of modules and decorators
-    for module_and_decorator in FLAGS.monkey_patch_modules:
+    for module_and_decorator in CONF.monkey_patch_modules:
         module, decorator_name = module_and_decorator.split(':')
         # import decorator function
         decorator = importutils.import_class(decorator_name)
@@ -874,59 +633,11 @@ def monkey_patch():
                         decorator("%s.%s" % (module, key), func))
 
 
-def convert_to_list_dict(lst, label):
-    """Convert a value or list into a list of dicts"""
-    if not lst:
-        return None
-    if not isinstance(lst, list):
-        lst = [lst]
-    return [{label: x} for x in lst]
-
-
-def timefunc(func):
-    """Decorator that logs how long a particular function took to execute"""
-    @functools.wraps(func)
-    def inner(*args, **kwargs):
-        start_time = time.time()
-        try:
-            return func(*args, **kwargs)
-        finally:
-            total_time = time.time() - start_time
-            LOG.debug(_("timefunc: '%(name)s' took %(total_time).2f secs") %
-                      dict(name=func.__name__, total_time=total_time))
-    return inner
-
-
 def generate_glance_url():
     """Generate the URL to glance."""
     # TODO(jk0): This will eventually need to take SSL into consideration
     # when supported in glance.
-    return "http://%s:%d" % (FLAGS.glance_host, FLAGS.glance_port)
-
-
-@contextlib.contextmanager
-def logging_error(message):
-    """Catches exception, write message to the log, re-raise.
-    This is a common refinement of save_and_reraise that writes a specific
-    message to the log.
-    """
-    try:
-        yield
-    except Exception as error:
-        with excutils.save_and_reraise_exception():
-            LOG.exception(message)
-
-
-@contextlib.contextmanager
-def remove_path_on_error(path):
-    """Protect code that wants to operate on PATH atomically.
-    Any exception will cause PATH to be removed.
-    """
-    try:
-        yield
-    except Exception:
-        with excutils.save_and_reraise_exception():
-            delete_if_exists(path)
+    return "http://%s:%d" % (CONF.glance_host, CONF.glance_port)
 
 
 def make_dev_path(dev, partition=None, base='/dev'):
@@ -986,18 +697,6 @@ def read_cached_file(filename, cache_info, reload_func=None):
     return cache_info['data']
 
 
-def file_open(*args, **kwargs):
-    """Open file
-
-    see built-in file() documentation for more details
-
-    Note: The reason this is kept in a separate module is to easily
-          be able to provide a stub module that doesn't alter system
-          state at all (for unit tests)
-    """
-    return file(*args, **kwargs)
-
-
 def hash_file(file_like_object):
     """Generate a hash for the contents of a file."""
     checksum = hashlib.sha1()
@@ -1005,55 +704,12 @@ def hash_file(file_like_object):
     return checksum.hexdigest()
 
 
-@contextlib.contextmanager
-def temporary_mutation(obj, **kwargs):
-    """Temporarily set the attr on a particular object to a given value then
-    revert when finished.
-
-    One use of this is to temporarily set the read_deleted flag on a context
-    object:
-
-        with temporary_mutation(context, read_deleted="yes"):
-            do_something_that_needed_deleted_objects()
-    """
-    NOT_PRESENT = object()
-
-    old_values = {}
-    for attr, new_value in kwargs.items():
-        old_values[attr] = getattr(obj, attr, NOT_PRESENT)
-        setattr(obj, attr, new_value)
-
-    try:
-        yield
-    finally:
-        for attr, old_value in old_values.items():
-            if old_value is NOT_PRESENT:
-                del obj[attr]
-            else:
-                setattr(obj, attr, old_value)
-
-
 def service_is_up(service):
     """Check whether a service is up based on last heartbeat."""
     last_heartbeat = service['updated_at'] or service['created_at']
     # Timestamps in DB are UTC.
     elapsed = total_seconds(timeutils.utcnow() - last_heartbeat)
-    return abs(elapsed) <= FLAGS.service_down_time
-
-
-def generate_mac_address():
-    """Generate an Ethernet MAC address."""
-    # NOTE(vish): We would prefer to use 0xfe here to ensure that linux
-    #             bridge mac addresses don't change, but it appears to
-    #             conflict with libvirt, so we use the next highest octet
-    #             that has the unicast and locally administered bits set
-    #             properly: 0xfa.
-    #             Discussion: https://bugs.launchpad.net/cinder/+bug/921838
-    mac = [0xfa, 0x16, 0x3e,
-           random.randint(0x00, 0x7f),
-           random.randint(0x00, 0xff),
-           random.randint(0x00, 0xff)]
-    return ':'.join(map(lambda x: "%02x" % x, mac))
+    return abs(elapsed) <= CONF.service_down_time
 
 
 def read_file_as_root(file_path):
@@ -1061,7 +717,7 @@ def read_file_as_root(file_path):
     try:
         out, _err = execute('cat', file_path, run_as_root=True)
         return out
-    except exception.ProcessExecutionError:
+    except processutils.ProcessExecutionError:
         raise exception.FileNotFound(file_path=file_path)
 
 
@@ -1093,28 +749,8 @@ def tempdir(**kwargs):
     finally:
         try:
             shutil.rmtree(tmpdir)
-        except OSError, e:
+        except OSError as e:
             LOG.debug(_('Could not remove tmpdir: %s'), str(e))
-
-
-def strcmp_const_time(s1, s2):
-    """Constant-time string comparison.
-
-    :params s1: the first string
-    :params s2: the second string
-
-    :return: True if the strings are equal.
-
-    This function takes two strings and compares them.  It is intended to be
-    used when doing a comparison for authentication purposes to help guard
-    against timing attacks.
-    """
-    if len(s1) != len(s2):
-        return False
-    result = 0
-    for (a, b) in zip(s1, s2):
-        result |= ord(a) ^ ord(b)
-    return result == 0
 
 
 def walk_class_hierarchy(clazz, encountered=None):
@@ -1130,79 +766,29 @@ def walk_class_hierarchy(clazz, encountered=None):
             yield subclass
 
 
-class UndoManager(object):
-    """Provides a mechanism to facilitate rolling back a series of actions
-    when an exception is raised.
+def get_root_helper():
+    return 'sudo cinder-rootwrap %s' % CONF.rootwrap_config
+
+
+def brick_get_connector_properties():
+    """wrapper for the brick calls to automatically set
+    the root_helper needed for cinder.
     """
-    def __init__(self):
-        self.undo_stack = []
 
-    def undo_with(self, undo_func):
-        self.undo_stack.append(undo_func)
-
-    def _rollback(self):
-        for undo_func in reversed(self.undo_stack):
-            undo_func()
-
-    def rollback_and_reraise(self, msg=None, **kwargs):
-        """Rollback a series of actions then re-raise the exception.
-
-        .. note:: (sirp) This should only be called within an
-                  exception handler.
-        """
-        with excutils.save_and_reraise_exception():
-            if msg:
-                LOG.exception(msg, **kwargs)
-
-            self._rollback()
+    root_helper = get_root_helper()
+    return connector.get_connector_properties(root_helper)
 
 
-def ensure_tree(path):
-    """Create a directory (and any ancestor directories required)
-
-    :param path: Directory to create
+def brick_get_connector(protocol, driver=None,
+                        execute=processutils.execute,
+                        use_multipath=False):
+    """Wrapper to get a brick connector object.
+    This automatically populates the required protocol as well
+    as the root_helper needed to execute commands.
     """
-    try:
-        os.makedirs(path)
-    except OSError as exc:
-        if exc.errno == errno.EEXIST:
-            if not os.path.isdir(path):
-                raise
-        else:
-            raise
 
-
-def to_bytes(text, default=0):
-    """Try to turn a string into a number of bytes. Looks at the last
-    characters of the text to determine what conversion is needed to
-    turn the input text into a byte number.
-
-    Supports: B/b, K/k, M/m, G/g, T/t (or the same with b/B on the end)
-
-    """
-    BYTE_MULTIPLIERS = {
-        '': 1,
-        't': 1024 ** 4,
-        'g': 1024 ** 3,
-        'm': 1024 ** 2,
-        'k': 1024,
-    }
-
-    # Take off everything not number 'like' (which should leave
-    # only the byte 'identifier' left)
-    mult_key_org = text.lstrip('-1234567890')
-    mult_key = mult_key_org.lower()
-    mult_key_len = len(mult_key)
-    if mult_key.endswith("b"):
-        mult_key = mult_key[0:-1]
-    try:
-        multiplier = BYTE_MULTIPLIERS[mult_key]
-        if mult_key_len:
-            # Empty cases shouldn't cause text[0:-0]
-            text = text[0:-mult_key_len]
-        return int(text) * multiplier
-    except KeyError:
-        msg = _('Unknown byte multiplier: %s') % mult_key_org
-        raise TypeError(msg)
-    except ValueError:
-        return default
+    root_helper = get_root_helper()
+    return connector.InitiatorConnector.factory(protocol, root_helper,
+                                                driver=driver,
+                                                execute=execute,
+                                                use_multipath=use_multipath)

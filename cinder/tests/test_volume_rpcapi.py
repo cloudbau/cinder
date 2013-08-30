@@ -19,25 +19,27 @@ Unit Tests for cinder.volume.rpcapi
 """
 
 
+from oslo.config import cfg
+
 from cinder import context
 from cinder import db
-from cinder import flags
 from cinder.openstack.common import jsonutils
 from cinder.openstack.common import rpc
 from cinder import test
 from cinder.volume import rpcapi as volume_rpcapi
 
 
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
 
 
 class VolumeRpcAPITestCase(test.TestCase):
 
     def setUp(self):
+        super(VolumeRpcAPITestCase, self).setUp()
         self.context = context.get_admin_context()
         vol = {}
         vol['host'] = 'fake_host'
-        vol['availability_zone'] = FLAGS.storage_availability_zone
+        vol['availability_zone'] = CONF.storage_availability_zone
         vol['status'] = "available"
         vol['attach_status'] = "detached"
         volume = db.volume_create(self.context, vol)
@@ -52,7 +54,6 @@ class VolumeRpcAPITestCase(test.TestCase):
         snapshot = db.snapshot_create(self.context, snpshot)
         self.fake_volume = jsonutils.to_primitive(volume)
         self.fake_snapshot = jsonutils.to_primitive(snapshot)
-        super(VolumeRpcAPITestCase, self).setUp()
 
     def test_serialized_volume_has_id(self):
         self.assertTrue('id' in self.fake_volume)
@@ -80,6 +81,16 @@ class VolumeRpcAPITestCase(test.TestCase):
             expected_msg['args']['snapshot_id'] = snapshot['id']
         if 'host' in expected_msg['args']:
             del expected_msg['args']['host']
+        if 'dest_host' in expected_msg['args']:
+            dest_host = expected_msg['args']['dest_host']
+            dest_host_dict = {'host': dest_host.host,
+                              'capabilities': dest_host.capabilities}
+            del expected_msg['args']['dest_host']
+            expected_msg['args']['host'] = dest_host_dict
+        if 'new_volume' in expected_msg['args']:
+            volume = expected_msg['args']['new_volume']
+            del expected_msg['args']['new_volume']
+            expected_msg['args']['new_volume_id'] = volume['id']
 
         expected_msg['version'] = expected_version
 
@@ -87,7 +98,7 @@ class VolumeRpcAPITestCase(test.TestCase):
             host = kwargs['host']
         else:
             host = kwargs['volume']['host']
-        expected_topic = '%s.%s' % (FLAGS.volume_topic, host)
+        expected_topic = '%s:%s' % (CONF.volume_topic, host)
 
         self.fake_args = None
         self.fake_kwargs = None
@@ -137,12 +148,25 @@ class VolumeRpcAPITestCase(test.TestCase):
                               snapshot=self.fake_snapshot,
                               host='fake_host')
 
-    def test_attach_volume(self):
+    def test_attach_volume_to_instance(self):
         self._test_volume_api('attach_volume',
                               rpc_method='call',
                               volume=self.fake_volume,
                               instance_uuid='fake_uuid',
-                              mountpoint='fake_mountpoint')
+                              host_name=None,
+                              mountpoint='fake_mountpoint',
+                              mode='ro',
+                              version='1.11')
+
+    def test_attach_volume_to_host(self):
+        self._test_volume_api('attach_volume',
+                              rpc_method='call',
+                              volume=self.fake_volume,
+                              instance_uuid=None,
+                              host_name='fake_host',
+                              mountpoint='fake_mountpoint',
+                              mode='rw',
+                              version='1.11')
 
     def test_detach_volume(self):
         self._test_volume_api('detach_volume',
@@ -170,3 +194,41 @@ class VolumeRpcAPITestCase(test.TestCase):
                               volume=self.fake_volume,
                               connector='fake_connector',
                               force=False)
+
+    def test_accept_transfer(self):
+        self._test_volume_api('accept_transfer',
+                              rpc_method='cast',
+                              volume=self.fake_volume,
+                              new_user='e5565fd0-06c8-11e3-'
+                                       '8ffd-0800200c9b77',
+                              new_project='e4465fd0-06c8-11e3'
+                                          '-8ffd-0800200c9a66',
+                              version='1.9')
+
+    def test_extend_volume(self):
+        self._test_volume_api('extend_volume',
+                              rpc_method='cast',
+                              volume=self.fake_volume,
+                              new_size=1,
+                              version='1.6')
+
+    def test_migrate_volume(self):
+        class FakeHost(object):
+            def __init__(self):
+                self.host = 'host'
+                self.capabilities = {}
+        dest_host = FakeHost()
+        self._test_volume_api('migrate_volume',
+                              rpc_method='cast',
+                              volume=self.fake_volume,
+                              dest_host=dest_host,
+                              force_host_copy=True,
+                              version='1.8')
+
+    def test_migrate_volume_completion(self):
+        self._test_volume_api('migrate_volume_completion',
+                              rpc_method='call',
+                              volume=self.fake_volume,
+                              new_volume=self.fake_volume,
+                              error=False,
+                              version='1.10')

@@ -16,6 +16,8 @@
 import datetime
 
 from lxml import etree
+from oslo.config import cfg
+import urllib
 import webob
 
 from cinder.api import extensions
@@ -23,7 +25,6 @@ from cinder.api.v1 import volumes
 from cinder import context
 from cinder import db
 from cinder import exception
-from cinder import flags
 from cinder import test
 from cinder.tests.api import fakes
 from cinder.tests.api.v2 import stubs
@@ -31,10 +32,11 @@ from cinder.tests.image import fake as fake_image
 from cinder.volume import api as volume_api
 
 
-FLAGS = flags.FLAGS
 NS = '{http://docs.openstack.org/volume/api/v1}'
 
 TEST_SNAPSHOT_UUID = '00000000-0000-0000-0000-000000000001'
+
+CONF = cfg.CONF
 
 
 def stub_snapshot_get(self, context, snapshot_id):
@@ -61,6 +63,9 @@ class VolumeApiTest(test.TestCase):
         self.stubs.Set(db, 'volume_get_all', stubs.stub_volume_get_all)
         self.stubs.Set(db, 'volume_get_all_by_project',
                        stubs.stub_volume_get_all_by_project)
+        self.stubs.Set(db, 'service_get_all_by_topic',
+                       stubs.stub_service_get_all_by_topic)
+        self.stubs.Set(db, 'volume_get', stubs.stub_volume_get_db)
         self.stubs.Set(volume_api.API, 'get', stubs.stub_volume_get)
         self.stubs.Set(volume_api.API, 'delete', stubs.stub_volume_delete)
 
@@ -80,13 +85,15 @@ class VolumeApiTest(test.TestCase):
                                'display_name': 'Volume Test Name',
                                'attachments': [{'device': '/',
                                                 'server_id': 'fakeuuid',
+                                                'host_name': None,
                                                 'id': '1',
                                                 'volume_id': '1'}],
-                               'bootable': 'false',
+                               'bootable': False,
                                'volume_type': 'vol_type_name',
                                'snapshot_id': None,
                                'source_volid': None,
-                               'metadata': {},
+                               'metadata': {'attached_mode': 'rw',
+                                            'readonly': 'False'},
                                'id': '1',
                                'created_at': datetime.datetime(1, 1, 1,
                                                                1, 1, 1),
@@ -94,7 +101,7 @@ class VolumeApiTest(test.TestCase):
         self.assertEqual(res_dict, expected)
 
     def test_volume_create_with_type(self):
-        vol_type = FLAGS.default_volume_type
+        vol_type = CONF.default_volume_type
         db.volume_type_create(context.get_admin_context(),
                               dict(name=vol_type, extra_specs={}))
         db_vol_type = db.volume_type_get_by_name(context.get_admin_context(),
@@ -123,6 +130,17 @@ class VolumeApiTest(test.TestCase):
                           req,
                           body)
 
+    def test_volume_creation_fails_with_bad_availability_zone(self):
+        vol = {"size": '1',
+               "name": "Volume Test Name",
+               "description": "Volume Test Desc",
+               "availability_zone": "zonen:hostn"}
+        body = {"volume": vol}
+        req = fakes.HTTPRequest.blank('/v2/volumes')
+        self.assertRaises(exception.InvalidInput,
+                          self.controller.create,
+                          req, body)
+
     def test_volume_create_with_image_id(self):
         self.stubs.Set(volume_api.API, "create", stubs.stub_volume_create)
         self.ext_mgr.extensions = {'os-image-create': 'fake'}
@@ -138,14 +156,16 @@ class VolumeApiTest(test.TestCase):
                                'display_name': 'Volume Test Name',
                                'attachments': [{'device': '/',
                                                 'server_id': 'fakeuuid',
+                                                'host_name': None,
                                                 'id': '1',
                                                 'volume_id': '1'}],
-                               'bootable': 'false',
+                               'bootable': False,
                                'volume_type': 'vol_type_name',
                                'image_id': test_id,
                                'snapshot_id': None,
                                'source_volid': None,
-                               'metadata': {},
+                               'metadata': {'attached_mode': 'rw',
+                                            'readonly': 'False'},
                                'id': '1',
                                'created_at': datetime.datetime(1, 1, 1,
                                                                1, 1, 1),
@@ -202,17 +222,18 @@ class VolumeApiTest(test.TestCase):
                 'id': '1',
                 'volume_id': '1',
                 'server_id': 'fakeuuid',
-                'device': '/',
+                'host_name': None,
+                'device': '/'
             }],
-            'bootable': 'false',
+            'bootable': False,
             'volume_type': 'vol_type_name',
             'snapshot_id': None,
             'source_volid': None,
-            'metadata': {},
+            'metadata': {'attached_mode': 'rw',
+                         'readonly': 'False'},
             'id': '1',
             'created_at': datetime.datetime(1, 1, 1, 1, 1, 1),
-            'size': 1,
-        }}
+            'size': 1}}
         self.assertEquals(res_dict, expected)
 
     def test_volume_update_metadata(self):
@@ -232,16 +253,19 @@ class VolumeApiTest(test.TestCase):
                 'id': '1',
                 'volume_id': '1',
                 'server_id': 'fakeuuid',
-                'device': '/',
+                'host_name': None,
+                'device': '/'
             }],
-            'bootable': 'false',
+            'bootable': False,
             'volume_type': 'vol_type_name',
             'snapshot_id': None,
             'source_volid': None,
-            'metadata': {"qos_max_iops": 2000},
+            'metadata': {"qos_max_iops": 2000,
+                         "readonly": "False",
+                         "attached_mode": "rw"},
             'id': '1',
             'created_at': datetime.datetime(1, 1, 1, 1, 1, 1),
-            'size': 1,
+            'size': 1
         }}
         self.assertEquals(res_dict, expected)
 
@@ -282,13 +306,15 @@ class VolumeApiTest(test.TestCase):
                                  'display_name': 'displayname',
                                  'attachments': [{'device': '/',
                                                   'server_id': 'fakeuuid',
+                                                  'host_name': None,
                                                   'id': '1',
                                                   'volume_id': '1'}],
-                                 'bootable': 'false',
+                                 'bootable': False,
                                  'volume_type': 'vol_type_name',
                                  'snapshot_id': None,
                                  'source_volid': None,
-                                 'metadata': {},
+                                 'metadata': {'attached_mode': 'rw',
+                                              'readonly': 'False'},
                                  'id': '1',
                                  'created_at': datetime.datetime(1, 1, 1,
                                                                  1, 1, 1),
@@ -306,13 +332,15 @@ class VolumeApiTest(test.TestCase):
                                  'display_name': 'displayname',
                                  'attachments': [{'device': '/',
                                                   'server_id': 'fakeuuid',
+                                                  'host_name': None,
                                                   'id': '1',
                                                   'volume_id': '1'}],
-                                 'bootable': 'false',
+                                 'bootable': False,
                                  'volume_type': 'vol_type_name',
                                  'snapshot_id': None,
                                  'source_volid': None,
-                                 'metadata': {},
+                                 'metadata': {'attached_mode': 'rw',
+                                              'readonly': 'False'},
                                  'id': '1',
                                  'created_at': datetime.datetime(1, 1, 1,
                                                                  1, 1, 1),
@@ -341,6 +369,64 @@ class VolumeApiTest(test.TestCase):
         self.assertEqual(resp['volumes'][0]['display_name'], 'vol2')
         # filter no match
         req = fakes.HTTPRequest.blank('/v1/volumes?display_name=vol4')
+        resp = self.controller.index(req)
+        self.assertEqual(len(resp['volumes']), 0)
+
+    def test_volume_list_by_metadata(self):
+        def stub_volume_get_all_by_project(context, project_id, marker, limit,
+                                           sort_key, sort_dir):
+            return [
+                stubs.stub_volume(1, display_name='vol1',
+                                  status='available',
+                                  volume_metadata=[{'key': 'key1',
+                                                    'value': 'value1'}]),
+                stubs.stub_volume(2, display_name='vol2',
+                                  status='available',
+                                  volume_metadata=[{'key': 'key1',
+                                                    'value': 'value2'}]),
+                stubs.stub_volume(3, display_name='vol3',
+                                  status='in-use',
+                                  volume_metadata=[{'key': 'key1',
+                                                    'value': 'value2'}]),
+            ]
+        self.stubs.Set(db, 'volume_get_all_by_project',
+                       stub_volume_get_all_by_project)
+
+        # no metadata filter
+        req = fakes.HTTPRequest.blank('/v1/volumes', use_admin_context=True)
+        resp = self.controller.index(req)
+        self.assertEqual(len(resp['volumes']), 3)
+
+        # single match
+        qparams = urllib.urlencode({'metadata': {'key1': 'value1'}})
+        req = fakes.HTTPRequest.blank('/v1/volumes?%s' % qparams,
+                                      use_admin_context=True)
+        resp = self.controller.index(req)
+        self.assertEqual(len(resp['volumes']), 1)
+        self.assertEqual(resp['volumes'][0]['display_name'], 'vol1')
+        self.assertEqual(resp['volumes'][0]['metadata']['key1'], 'value1')
+
+        # multiple matches
+        qparams = urllib.urlencode({'metadata': {'key1': 'value2'}})
+        req = fakes.HTTPRequest.blank('/v1/volumes?%s' % qparams,
+                                      use_admin_context=True)
+        resp = self.controller.index(req)
+        self.assertEqual(len(resp['volumes']), 2)
+        for volume in resp['volumes']:
+            self.assertEqual(volume['metadata']['key1'], 'value2')
+
+        # multiple filters
+        qparams = urllib.urlencode({'metadata': {'key1': 'value2'}})
+        req = fakes.HTTPRequest.blank('/v1/volumes?status=in-use&%s' % qparams,
+                                      use_admin_context=True)
+        resp = self.controller.index(req)
+        self.assertEqual(len(resp['volumes']), 1)
+        self.assertEqual(resp['volumes'][0]['display_name'], 'vol3')
+
+        # no match
+        qparams = urllib.urlencode({'metadata': {'key1': 'value3'}})
+        req = fakes.HTTPRequest.blank('/v1/volumes?%s' % qparams,
+                                      use_admin_context=True)
         resp = self.controller.index(req)
         self.assertEqual(len(resp['volumes']), 0)
 
@@ -391,13 +477,15 @@ class VolumeApiTest(test.TestCase):
                                'display_name': 'displayname',
                                'attachments': [{'device': '/',
                                                 'server_id': 'fakeuuid',
+                                                'host_name': None,
                                                 'id': '1',
                                                 'volume_id': '1'}],
-                               'bootable': 'false',
+                               'bootable': False,
                                'volume_type': 'vol_type_name',
                                'snapshot_id': None,
                                'source_volid': None,
-                               'metadata': {},
+                               'metadata': {'attached_mode': 'rw',
+                                            'readonly': 'False'},
                                'id': '1',
                                'created_at': datetime.datetime(1, 1, 1,
                                                                1, 1, 1),
@@ -417,11 +505,11 @@ class VolumeApiTest(test.TestCase):
                                'availability_zone': 'fakeaz',
                                'display_name': 'displayname',
                                'attachments': [],
-                               'bootable': 'false',
+                               'bootable': False,
                                'volume_type': 'vol_type_name',
                                'snapshot_id': None,
                                'source_volid': None,
-                               'metadata': {},
+                               'metadata': {'readonly': 'False'},
                                'id': '1',
                                'created_at': datetime.datetime(1, 1, 1,
                                                                1, 1, 1),
@@ -443,13 +531,15 @@ class VolumeApiTest(test.TestCase):
                                'display_name': 'displayname',
                                'attachments': [{'device': '/',
                                                 'server_id': 'fakeuuid',
+                                                'host_name': None,
                                                 'id': '1',
                                                 'volume_id': '1'}],
-                               'bootable': 'true',
+                               'bootable': True,
                                'volume_type': 'vol_type_name',
                                'snapshot_id': None,
                                'source_volid': None,
-                               'metadata': {},
+                               'metadata': {'attached_mode': 'rw',
+                                            'readonly': 'False'},
                                'id': '1',
                                'created_at': datetime.datetime(1, 1, 1,
                                                                1, 1, 1),
@@ -464,6 +554,30 @@ class VolumeApiTest(test.TestCase):
                           self.controller.show,
                           req,
                           1)
+
+    def test_volume_detail_limit_offset(self):
+        def volume_detail_limit_offset(is_admin):
+            def stub_volume_get_all_by_project(context, project_id, marker,
+                                               limit, sort_key, sort_dir):
+                return [
+                    stubs.stub_volume(1, display_name='vol1'),
+                    stubs.stub_volume(2, display_name='vol2'),
+                ]
+
+            self.stubs.Set(db, 'volume_get_all_by_project',
+                           stub_volume_get_all_by_project)
+            req = fakes.HTTPRequest.blank('/v1/volumes/detail?limit=2\
+                                          &offset=1',
+                                          use_admin_context=is_admin)
+            res_dict = self.controller.index(req)
+            volumes = res_dict['volumes']
+            self.assertEquals(len(volumes), 1)
+            self.assertEquals(volumes[0]['id'], 2)
+
+        #admin case
+        volume_detail_limit_offset(is_admin=True)
+        #non_admin case
+        volume_detail_limit_offset(is_admin=False)
 
     def test_volume_delete(self):
         req = fakes.HTTPRequest.blank('/v1/volumes/1')
@@ -517,11 +631,10 @@ class VolumeSerializerTest(test.TestCase):
 
         for attr in ('id', 'status', 'size', 'availability_zone', 'created_at',
                      'display_name', 'display_description', 'volume_type',
-                     'snapshot_id'):
+                     'bootable', 'snapshot_id'):
             self.assertEqual(str(vol[attr]), tree.get(attr))
 
         for child in tree:
-            print child.tag
             self.assertTrue(child.tag in (NS + 'attachments', NS + 'metadata'))
             if child.tag == 'attachments':
                 self.assertEqual(1, len(child))
@@ -543,6 +656,7 @@ class VolumeSerializerTest(test.TestCase):
             status='vol_status',
             size=1024,
             availability_zone='vol_availability',
+            bootable=False,
             created_at=datetime.datetime.now(),
             attachments=[dict(id='vol_id',
                               volume_id='vol_id',
@@ -557,7 +671,6 @@ class VolumeSerializerTest(test.TestCase):
                           baz='quux', ), )
         text = serializer.serialize(dict(volume=raw_volume))
 
-        print text
         tree = etree.fromstring(text)
 
         self._verify_volume(raw_volume, tree)
@@ -568,6 +681,7 @@ class VolumeSerializerTest(test.TestCase):
                             status='vol1_status',
                             size=1024,
                             availability_zone='vol1_availability',
+                            bootable=True,
                             created_at=datetime.datetime.now(),
                             attachments=[dict(id='vol1_id',
                                               volume_id='vol1_id',
@@ -584,6 +698,7 @@ class VolumeSerializerTest(test.TestCase):
                             status='vol2_status',
                             size=1024,
                             availability_zone='vol2_availability',
+                            bootable=False,
                             created_at=datetime.datetime.now(),
                             attachments=[dict(id='vol2_id',
                                               volume_id='vol2_id',
@@ -598,7 +713,6 @@ class VolumeSerializerTest(test.TestCase):
                                           bar='vol2_bar', ), )]
         text = serializer.serialize(dict(volumes=raw_volumes))
 
-        print text
         tree = etree.fromstring(text)
 
         self.assertEqual(NS + 'volumes', tree.tag)
@@ -731,6 +845,60 @@ class TestVolumeCreateRequestXMLDeserializer(test.TestCase):
             },
         }
         self.assertEquals(request['body'], expected)
+
+    def test_imageref(self):
+        self_request = """
+<volume xmlns="http://docs.openstack.org/volume/api/v1"
+        size="1"
+        display_name="Volume-xml"
+        display_description="description"
+        imageRef="4a90189d-d702-4c7c-87fc-6608c554d737"></volume>"""
+        request = self.deserializer.deserialize(self_request)
+        expected = {
+            "volume": {
+                "size": "1",
+                "display_name": "Volume-xml",
+                "display_description": "description",
+                "imageRef": "4a90189d-d702-4c7c-87fc-6608c554d737",
+            },
+        }
+        self.assertEquals(expected, request['body'])
+
+    def test_snapshot_id(self):
+        self_request = """
+<volume xmlns="http://docs.openstack.org/volume/api/v1"
+        size="1"
+        display_name="Volume-xml"
+        display_description="description"
+        snapshot_id="4a90189d-d702-4c7c-87fc-6608c554d737"></volume>"""
+        request = self.deserializer.deserialize(self_request)
+        expected = {
+            "volume": {
+                "size": "1",
+                "display_name": "Volume-xml",
+                "display_description": "description",
+                "snapshot_id": "4a90189d-d702-4c7c-87fc-6608c554d737",
+            },
+        }
+        self.assertEquals(expected, request['body'])
+
+    def test_source_volid(self):
+        self_request = """
+<volume xmlns="http://docs.openstack.org/volume/api/v1"
+        size="1"
+        display_name="Volume-xml"
+        display_description="description"
+        source_volid="4a90189d-d702-4c7c-87fc-6608c554d737"></volume>"""
+        request = self.deserializer.deserialize(self_request)
+        expected = {
+            "volume": {
+                "size": "1",
+                "display_name": "Volume-xml",
+                "display_description": "description",
+                "source_volid": "4a90189d-d702-4c7c-87fc-6608c554d737",
+            },
+        }
+        self.assertEquals(expected, request['body'])
 
 
 class VolumesUnprocessableEntityTestCase(test.TestCase):

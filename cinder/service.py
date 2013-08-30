@@ -19,6 +19,7 @@
 
 """Generic Node base class for all workers that run on hosts."""
 
+
 import errno
 import inspect
 import os
@@ -34,13 +35,13 @@ from oslo.config import cfg
 from cinder import context
 from cinder import db
 from cinder import exception
-from cinder import flags
 from cinder.openstack.common import importutils
 from cinder.openstack.common import log as logging
 from cinder.openstack.common import rpc
 from cinder import utils
 from cinder import version
 from cinder import wsgi
+
 
 LOG = logging.getLogger(__name__)
 
@@ -63,8 +64,8 @@ service_opts = [
                default=8776,
                help='port for os volume api to listen'), ]
 
-FLAGS = flags.FLAGS
-FLAGS.register_opts(service_opts)
+CONF = cfg.CONF
+CONF.register_opts(service_opts)
 
 
 class SignalExit(SystemExit):
@@ -142,12 +143,15 @@ class ServerWrapper(object):
         self.workers = workers
         self.children = set()
         self.forktimes = []
+        self.failed = False
 
 
 class ProcessLauncher(object):
     def __init__(self):
         self.children = {}
         self.sigcaught = None
+        self.totalwrap = 0
+        self.failedwrap = 0
         self.running = True
         rfd, self.writepipe = os.pipe()
         self.readpipe = eventlet.greenio.GreenPipe(rfd, 'r')
@@ -246,9 +250,10 @@ class ProcessLauncher(object):
 
     def launch_server(self, server, workers=1):
         wrap = ServerWrapper(server, workers)
-
+        self.totalwrap = self.totalwrap + 1
         LOG.info(_('Starting %d workers'), wrap.workers)
-        while self.running and len(wrap.children) < wrap.workers:
+        while (self.running and len(wrap.children) < wrap.workers
+               and not wrap.failed):
             self._start_child(wrap)
 
     def _wait_child(self):
@@ -262,12 +267,15 @@ class ProcessLauncher(object):
                 raise
             return None
 
+        code = 0
         if os.WIFSIGNALED(status):
             sig = os.WTERMSIG(status)
-            LOG.info(_('Child %(pid)d killed by signal %(sig)d'), locals())
+            LOG.info(_('Child %(pid)d killed by signal %(sig)d'),
+                     {'pid': pid, 'sig': sig})
         else:
             code = os.WEXITSTATUS(status)
-            LOG.info(_('Child %(pid)d exited with status %(code)d'), locals())
+            LOG.info(_('Child %(pid)d exited with status %(code)d'),
+                     {'pid': pid, 'code': code})
 
         if pid not in self.children:
             LOG.warning(_('pid %d not in child list'), pid)
@@ -275,6 +283,12 @@ class ProcessLauncher(object):
 
         wrap = self.children.pop(pid)
         wrap.children.remove(pid)
+        if 2 == code:
+            wrap.failed = True
+            self.failedwrap = self.failedwrap + 1
+            LOG.info(_('_wait_child %d'), self.failedwrap)
+            if self.failedwrap == self.totalwrap:
+                self.running = False
         return wrap
 
     def wait(self):
@@ -288,7 +302,9 @@ class ProcessLauncher(object):
                 eventlet.greenthread.sleep(.01)
                 continue
 
-            while self.running and len(wrap.children) < wrap.workers:
+            LOG.info(_('wait wrap.failed %s'), wrap.failed)
+            while (self.running and len(wrap.children) < wrap.workers
+                   and not wrap.failed):
                 self._start_child(wrap)
 
         if self.sigcaught:
@@ -315,7 +331,8 @@ class Service(object):
 
     A service takes a manager and enables rpc by listening to queues based
     on topic. It also periodically runs tasks on the manager and reports
-    it state to the database services table."""
+    it state to the database services table.
+    """
 
     def __init__(self, host, binary, topic, manager, report_interval=None,
                  periodic_interval=None, periodic_fuzzy_delay=None,
@@ -339,7 +356,6 @@ class Service(object):
         version_string = version.version_string()
         LOG.audit(_('Starting %(topic)s node (version %(version_string)s)'),
                   {'topic': self.topic, 'version_string': version_string})
-        self.manager.init_host()
         self.model_disconnected = False
         ctxt = context.get_admin_context()
         try:
@@ -359,13 +375,14 @@ class Service(object):
         # Share this same connection for these Consumers
         self.conn.create_consumer(self.topic, rpc_dispatcher, fanout=False)
 
-        node_topic = '%s.%s' % (self.topic, self.host)
+        node_topic = '%s:%s' % (self.topic, self.host)
         self.conn.create_consumer(node_topic, rpc_dispatcher, fanout=False)
 
         self.conn.create_consumer(self.topic, rpc_dispatcher, fanout=True)
 
         # Consume from all consumers in a thread
         self.conn.consume_in_thread()
+        self.manager.init_host()
 
         if self.report_interval:
             pulse = utils.LoopingCall(self.report_state)
@@ -385,7 +402,7 @@ class Service(object):
             self.timers.append(periodic)
 
     def _create_service_ref(self, context):
-        zone = FLAGS.storage_availability_zone
+        zone = CONF.storage_availability_zone
         service_ref = db.service_create(context,
                                         {'host': self.host,
                                          'binary': self.binary,
@@ -404,30 +421,30 @@ class Service(object):
                periodic_fuzzy_delay=None, service_name=None):
         """Instantiates class and passes back application object.
 
-        :param host: defaults to FLAGS.host
+        :param host: defaults to CONF.host
         :param binary: defaults to basename of executable
         :param topic: defaults to bin_name - 'cinder-' part
-        :param manager: defaults to FLAGS.<topic>_manager
-        :param report_interval: defaults to FLAGS.report_interval
-        :param periodic_interval: defaults to FLAGS.periodic_interval
-        :param periodic_fuzzy_delay: defaults to FLAGS.periodic_fuzzy_delay
+        :param manager: defaults to CONF.<topic>_manager
+        :param report_interval: defaults to CONF.report_interval
+        :param periodic_interval: defaults to CONF.periodic_interval
+        :param periodic_fuzzy_delay: defaults to CONF.periodic_fuzzy_delay
 
         """
         if not host:
-            host = FLAGS.host
+            host = CONF.host
         if not binary:
             binary = os.path.basename(inspect.stack()[-1][1])
         if not topic:
             topic = binary
         if not manager:
             subtopic = topic.rpartition('cinder-')[2]
-            manager = FLAGS.get('%s_manager' % subtopic, None)
+            manager = CONF.get('%s_manager' % subtopic, None)
         if report_interval is None:
-            report_interval = FLAGS.report_interval
+            report_interval = CONF.report_interval
         if periodic_interval is None:
-            periodic_interval = FLAGS.periodic_interval
+            periodic_interval = CONF.periodic_interval
         if periodic_fuzzy_delay is None:
-            periodic_fuzzy_delay = FLAGS.periodic_fuzzy_delay
+            periodic_fuzzy_delay = CONF.periodic_fuzzy_delay
         service_obj = cls(host, binary, topic, manager,
                           report_interval=report_interval,
                           periodic_interval=periodic_interval,
@@ -473,7 +490,7 @@ class Service(object):
     def report_state(self):
         """Update the state of this service in the datastore."""
         ctxt = context.get_admin_context()
-        zone = FLAGS.storage_availability_zone
+        zone = CONF.storage_availability_zone
         state_catalog = {}
         try:
             try:
@@ -518,8 +535,8 @@ class WSGIService(object):
         self.manager = self._get_manager()
         self.loader = loader or wsgi.Loader()
         self.app = self.loader.load_app(name)
-        self.host = getattr(FLAGS, '%s_listen' % name, "0.0.0.0")
-        self.port = getattr(FLAGS, '%s_listen_port' % name, 0)
+        self.host = getattr(CONF, '%s_listen' % name, "0.0.0.0")
+        self.port = getattr(CONF, '%s_listen_port' % name, 0)
         self.server = wsgi.Server(name,
                                   self.app,
                                   host=self.host,
@@ -536,10 +553,10 @@ class WSGIService(object):
 
         """
         fl = '%s_manager' % self.name
-        if fl not in FLAGS:
+        if fl not in CONF:
             return None
 
-        manager_class_name = FLAGS.get(fl, None)
+        manager_class_name = CONF.get(fl, None)
         if not manager_class_name:
             return None
 
@@ -592,16 +609,17 @@ def serve(*servers):
 
 
 def wait():
-    LOG.debug(_('Full set of FLAGS:'))
-    for flag in FLAGS:
-        flag_get = FLAGS.get(flag, None)
+    LOG.debug(_('Full set of CONF:'))
+    for flag in CONF:
+        flag_get = CONF.get(flag, None)
         # hide flag contents from log if contains a password
         # should use secret flag when switch over to openstack-common
         if ("_password" in flag or "_key" in flag or
                 (flag == "sql_connection" and "mysql:" in flag_get)):
-            LOG.debug(_('%(flag)s : FLAG SET ') % locals())
+            LOG.debug(_('%s : FLAG SET ') % flag)
         else:
-            LOG.debug('%(flag)s : %(flag_get)s' % locals())
+            LOG.debug('%(flag)s : %(flag_get)s' %
+                      {'flag': flag, 'flag_get': flag_get})
     try:
         _launcher.wait()
     except KeyboardInterrupt:

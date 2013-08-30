@@ -1,6 +1,7 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 # Copyright 2011 OpenStack LLC.
+# Copyright 2013 IBM Corp.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -21,6 +22,7 @@ import time
 import webob
 
 from cinder import exception
+from cinder.openstack.common import gettextutils
 from cinder.openstack.common import jsonutils
 from cinder.openstack.common import log as logging
 from cinder import utils
@@ -101,6 +103,17 @@ class Request(webob.Request):
 
         return content_type
 
+    def best_match_language(self):
+        """Determines best available locale from the Accept-Language header.
+
+        :returns: the best language match or None if the 'Accept-Language'
+                  header was not available in the request.
+        """
+        if not self.accept_language:
+            return None
+        all_languages = gettextutils.get_available_languages('cinder')
+        return self.accept_language.best_match(all_languages)
+
 
 class ActionDispatcher(object):
     """Maps method name to local methods through action name."""
@@ -178,6 +191,15 @@ class XMLDeserializer(TextDeserializer):
                     result[child.nodeName] = self._from_xml_node(child,
                                                                  listnames)
             return result
+
+    def find_first_child_named_in_namespace(self, parent, namespace, name):
+        """Search a nodes children for the first child with a given name."""
+        for node in parent.childNodes:
+            if (node.localName == name and
+                    node.namespaceURI and
+                    node.namespaceURI == namespace):
+                return node
+        return None
 
     def find_first_child_named(self, parent, name):
         """Search a nodes children for the first child with a given name"""
@@ -571,11 +593,10 @@ class ResourceExceptionHandler(object):
             return True
 
         if isinstance(ex_value, exception.NotAuthorized):
-            msg = unicode(ex_value)
-            raise Fault(webob.exc.HTTPForbidden(explanation=msg))
+            raise Fault(webob.exc.HTTPForbidden(explanation=ex_value.msg))
         elif isinstance(ex_value, exception.Invalid):
             raise Fault(exception.ConvertedException(
-                code=ex_value.code, explanation=unicode(ex_value)))
+                code=ex_value.code, explanation=ex_value.msg))
         elif isinstance(ex_value, TypeError):
             exc_info = (ex_type, ex_value, ex_traceback)
             LOG.error(_(
@@ -884,7 +905,7 @@ class Resource(wsgi.Application):
         try:
             msg_dict = dict(url=request.url, status=response.status_int)
             msg = _("%(url)s returned with HTTP %(status)d") % msg_dict
-        except AttributeError, e:
+        except AttributeError as e:
             msg_dict = dict(url=request.url, e=e)
             msg = _("%(url)s returned a fault: %(e)s") % msg_dict
 
@@ -1060,12 +1081,15 @@ class Fault(webob.exc.HTTPException):
     def __call__(self, req):
         """Generate a WSGI response based on the exception passed to ctor."""
         # Replace the body with fault details.
+        locale = req.best_match_language()
         code = self.wrapped_exc.status_int
         fault_name = self._fault_names.get(code, "computeFault")
+        explanation = self.wrapped_exc.explanation
         fault_data = {
             fault_name: {
                 'code': code,
-                'message': self.wrapped_exc.explanation}}
+                'message': gettextutils.get_localized_message(explanation,
+                                                              locale)}}
         if code == 413:
             retry = self.wrapped_exc.headers['Retry-After']
             fault_data[fault_name]['retryAfter'] = retry
@@ -1125,12 +1149,18 @@ class OverLimitFault(webob.exc.HTTPException):
 
     @webob.dec.wsgify(RequestClass=Request)
     def __call__(self, request):
-        """
-        Return the wrapped exception with a serialized body conforming to our
-        error format.
-        """
+        """Serializes the wrapped exception conforming to our error format."""
         content_type = request.best_match_content_type()
         metadata = {"attributes": {"overLimitFault": "code"}}
+
+        def translate(msg):
+            locale = request.best_match_language()
+            return gettextutils.get_localized_message(msg, locale)
+
+        self.content['overLimitFault']['message'] = \
+            translate(self.content['overLimitFault']['message'])
+        self.content['overLimitFault']['details'] = \
+            translate(self.content['overLimitFault']['details'])
 
         xml_serializer = XMLDictSerializer(metadata, XMLNS_V1)
         serializer = {

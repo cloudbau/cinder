@@ -12,13 +12,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+
+from oslo.config import cfg
+
 from cinder import context
-from cinder import flags
 from cinder.openstack.common import importutils
 from cinder import test
-from cinder.volume.drivers.solidfire import SolidFire
+from cinder.volume.drivers.solidfire import SolidFireDriver
 
-FLAGS = flags.FLAGS
+
+CONF = cfg.CONF
 
 RBD_MODULE = "cinder.volume.drivers.rbd.RBDDriver"
 SHEEPDOG_MODULE = "cinder.volume.drivers.sheepdog.SheepdogDriver"
@@ -26,16 +29,13 @@ NEXENTA_MODULE = "cinder.volume.drivers.nexenta.volume.NexentaDriver"
 SAN_MODULE = "cinder.volume.drivers.san.san.SanISCSIDriver"
 SOLARIS_MODULE = "cinder.volume.drivers.san.solaris.SolarisISCSIDriver"
 LEFTHAND_MODULE = "cinder.volume.drivers.san.hp_lefthand.HpSanISCSIDriver"
-NETAPP_MODULE = "cinder.volume.drivers.netapp.iscsi.NetAppISCSIDriver"
-NETAPP_CMODE_MODULE =\
-    "cinder.volume.drivers.netapp.iscsi.NetAppCmodeISCSIDriver"
-NETAPP_NFS_MODULE = "cinder.volume.drivers.netapp.nfs.NetAppNFSDriver"
 NFS_MODULE = "cinder.volume.drivers.nfs.NfsDriver"
-SOLIDFIRE_MODULE = "cinder.volume.drivers.solidfire.SolidFire"
+SOLIDFIRE_MODULE = "cinder.volume.drivers.solidfire.SolidFireDriver"
 STORWIZE_SVC_MODULE = "cinder.volume.drivers.storwize_svc.StorwizeSVCDriver"
 WINDOWS_MODULE = "cinder.volume.drivers.windows.WindowsDriver"
-XIV_MODULE = "cinder.volume.drivers.xiv.XIVDriver"
+XIV_DS8K_MODULE = "cinder.volume.drivers.xiv_ds8k.XIVDS8KDriver"
 ZADARA_MODULE = "cinder.volume.drivers.zadara.ZadaraVPSAISCSIDriver"
+NETAPP_MODULE = "cinder.volume.drivers.netapp.common.Deprecated"
 
 
 class VolumeDriverCompatibility(test.TestCase):
@@ -46,7 +46,7 @@ class VolumeDriverCompatibility(test.TestCase):
 
     def setUp(self):
         super(VolumeDriverCompatibility, self).setUp()
-        self.manager = importutils.import_object(FLAGS.volume_manager)
+        self.manager = importutils.import_object(CONF.volume_manager)
         self.context = context.get_admin_context()
 
     def tearDown(self):
@@ -55,7 +55,7 @@ class VolumeDriverCompatibility(test.TestCase):
     def _load_driver(self, driver):
         if 'SolidFire' in driver:
             # SolidFire driver does update_cluster stat on init
-            self.stubs.Set(SolidFire, '_update_cluster_status',
+            self.stubs.Set(SolidFireDriver, '_update_cluster_status',
                            self.fake_update_cluster_status)
         self.manager.__init__(volume_driver=driver)
 
@@ -111,30 +111,6 @@ class VolumeDriverCompatibility(test.TestCase):
         self._load_driver(LEFTHAND_MODULE)
         self.assertEquals(self._driver_module_name(), LEFTHAND_MODULE)
 
-    def test_netapp_old(self):
-        self._load_driver('cinder.volume.netapp.NetAppISCSIDriver')
-        self.assertEquals(self._driver_module_name(), NETAPP_MODULE)
-
-    def test_netapp_new(self):
-        self._load_driver(NETAPP_MODULE)
-        self.assertEquals(self._driver_module_name(), NETAPP_MODULE)
-
-    def test_netapp_cmode_old(self):
-        self._load_driver('cinder.volume.netapp.NetAppCmodeISCSIDriver')
-        self.assertEquals(self._driver_module_name(), NETAPP_CMODE_MODULE)
-
-    def test_netapp_cmode_new(self):
-        self._load_driver(NETAPP_CMODE_MODULE)
-        self.assertEquals(self._driver_module_name(), NETAPP_CMODE_MODULE)
-
-    def test_netapp_nfs_old(self):
-        self._load_driver('cinder.volume.netapp_nfs.NetAppNFSDriver')
-        self.assertEquals(self._driver_module_name(), NETAPP_NFS_MODULE)
-
-    def test_netapp_nfs_new(self):
-        self._load_driver(NETAPP_NFS_MODULE)
-        self.assertEquals(self._driver_module_name(), NETAPP_NFS_MODULE)
-
     def test_nfs_old(self):
         self._load_driver('cinder.volume.nfs.NfsDriver')
         self.assertEquals(self._driver_module_name(), NFS_MODULE)
@@ -145,6 +121,10 @@ class VolumeDriverCompatibility(test.TestCase):
 
     def test_solidfire_old(self):
         self._load_driver('cinder.volume.solidfire.SolidFire')
+        self.assertEquals(self._driver_module_name(), SOLIDFIRE_MODULE)
+
+    def test_solidfire_old2(self):
+        self._load_driver('cinder.volume.drivers.solidfire.SolidFire')
         self.assertEquals(self._driver_module_name(), SOLIDFIRE_MODULE)
 
     def test_solidfire_new(self):
@@ -169,11 +149,11 @@ class VolumeDriverCompatibility(test.TestCase):
 
     def test_xiv_old(self):
         self._load_driver('cinder.volume.xiv.XIVDriver')
-        self.assertEquals(self._driver_module_name(), XIV_MODULE)
+        self.assertEquals(self._driver_module_name(), XIV_DS8K_MODULE)
 
-    def test_xiv_new(self):
-        self._load_driver(XIV_MODULE)
-        self.assertEquals(self._driver_module_name(), XIV_MODULE)
+    def test_xiv_ds8k_new(self):
+        self._load_driver(XIV_DS8K_MODULE)
+        self.assertEquals(self._driver_module_name(), XIV_DS8K_MODULE)
 
     def test_zadara_old(self):
         self._load_driver('cinder.volume.zadara.ZadaraVPSAISCSIDriver')
@@ -182,3 +162,34 @@ class VolumeDriverCompatibility(test.TestCase):
     def test_zadara_new(self):
         self._load_driver(ZADARA_MODULE)
         self.assertEquals(self._driver_module_name(), ZADARA_MODULE)
+
+    def test_netapp_7m_iscsi_old(self):
+        self._load_driver(
+            'cinder.volume.drivers.netapp.iscsi.NetAppISCSIDriver')
+        self.assertEquals(self._driver_module_name(), NETAPP_MODULE)
+
+    def test_netapp_7m_iscsi_old_old(self):
+        self._load_driver('cinder.volume.netapp.NetAppISCSIDriver')
+        self.assertEquals(self._driver_module_name(), NETAPP_MODULE)
+
+    def test_netapp_cm_iscsi_old_old(self):
+        self._load_driver('cinder.volume.netapp.NetAppCmodeISCSIDriver')
+        self.assertEquals(self._driver_module_name(), NETAPP_MODULE)
+
+    def test_netapp_cm_iscsi_old(self):
+        self._load_driver(
+            'cinder.volume.drivers.netapp.iscsi.NetAppCmodeISCSIDriver')
+        self.assertEquals(self._driver_module_name(), NETAPP_MODULE)
+
+    def test_netapp_7m_nfs_old_old(self):
+        self._load_driver('cinder.volume.netapp_nfs.NetAppNFSDriver')
+        self.assertEquals(self._driver_module_name(), NETAPP_MODULE)
+
+    def test_netapp_7m_nfs_old(self):
+        self._load_driver('cinder.volume.drivers.netapp.nfs.NetAppNFSDriver')
+        self.assertEquals(self._driver_module_name(), NETAPP_MODULE)
+
+    def test_netapp_cm_nfs_old(self):
+        self._load_driver(
+            'cinder.volume.drivers.netapp.nfs.NetAppCmodeNfsDriver')
+        self.assertEquals(self._driver_module_name(), NETAPP_MODULE)

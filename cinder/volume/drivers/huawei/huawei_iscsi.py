@@ -17,9 +17,12 @@
 """
 Volume driver for HUAWEI T series and Dorado storage systems.
 """
-
+import base64
+import os
+import paramiko
 import re
 import socket
+import threading
 import time
 
 from oslo.config import cfg
@@ -45,61 +48,88 @@ VOL_AND_SNAP_NAME_PREFIX = 'OpenStack_'
 READBUFFERSIZE = 8192
 
 
-class SSHConnection(utils.SSHPool):
-    """An SSH connetion class .
+CONF = cfg.CONF
+CONF.register_opts(huawei_opt)
 
-    For some reasons, we can not use method ssh_execute defined in utils to
-    send CLI commands. Here we define a new class inherited to SSHPool. Use
-    method create() to build a new SSH client and use invoke_shell() to start
-    an interactive shell session on the storage system.
+
+class SSHConn(utils.SSHPool):
+    """Define a new class inherited to SSHPool.
+
+    This class rewrites method create() and defines a private method
+    ssh_read() which reads results of ssh commands.
     """
 
-    def __init__(self, ip, port, login, password, conn_timeout,
+    def __init__(self, ip, port, conn_timeout, login, password,
                  privatekey=None, *args, **kwargs):
-        self.ssh = None
-        super(SSHConnection, self).__init__(ip, port, conn_timeout, login,
-                                            password, privatekey=None,
-                                            *args, **kwargs)
 
-    def connect(self):
-        """Create an SSH client and open an interactive SSH channel."""
-        self.ssh = self.create()
-        self.channel = self.ssh.invoke_shell()
-        self.channel.resize_pty(600, 800)
+        super(SSHConn, self).__init__(ip, port, conn_timeout, login,
+                                      password, privatekey=None,
+                                      *args, **kwargs)
+        self.lock = threading.Lock()
 
-    def close(self):
-        """Close SSH connection."""
-        self.channel.close()
-        self.ssh.close()
+    def create(self):
+        """Create an SSH client.
 
-    def read(self, timeout=None):
-        """Read data from SSH channel."""
+        Because seting socket timeout to be None will cause client.close()
+        blocking, here we have to rewrite method create() and use default
+        socket timeout value 0.1.
+        """
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            if self.password:
+                ssh.connect(self.ip,
+                            port=self.port,
+                            username=self.login,
+                            password=self.password,
+                            timeout=self.conn_timeout)
+            elif self.privatekey:
+                pkfile = os.path.expanduser(self.privatekey)
+                privatekey = paramiko.RSAKey.from_private_key_file(pkfile)
+                ssh.connect(self.ip,
+                            port=self.port,
+                            username=self.login,
+                            pkey=privatekey,
+                            timeout=self.conn_timeout)
+            else:
+                msg = _("Specify a password or private_key")
+                raise exception.CinderException(msg)
+
+            if self.conn_timeout:
+                transport = ssh.get_transport()
+                transport.set_keepalive(self.conn_timeout)
+            return ssh
+        except Exception as e:
+            msg = _("Error connecting via ssh: %s") % e
+            LOG.error(msg)
+            raise paramiko.SSHException(msg)
+
+    def ssh_read(self, channel, cmd, timeout):
+        """Get results of CLI commands."""
         result = ''
-        user_flg = self.login + ':/>$'
-        self.channel.settimeout(timeout)
+        user = self.login
+        user_flg = user + ':/>$'
+        channel.settimeout(timeout)
         while True:
             try:
-                result = result + self.channel.recv(READBUFFERSIZE)
+                result = result + channel.recv(READBUFFERSIZE)
             except socket.timeout:
-                break
+                raise exception.VolumeBackendAPIException(_('read timed out'))
             else:
-                # If we get the complete result string, then no need to wait
-                # until time out.
-                if re.search(user_flg, result) or re.search('(y/n)', result):
+                if re.search(cmd, result) and re.search(user_flg, result):
+                    if not re.search('Welcome', result):
+                        break
+                    elif re.search(user + ':/>' + cmd, result):
+                        break
+                elif re.search('(y/n)', result):
                     break
-        return result
-
-    def send_cmd(self, strcmd, timeout, waitstr=None):
-        """Send SSH commands and return results."""
-        info = ''
-        self.channel.send(strcmd + '\n')
-        result = self.read(timeout)
-        info = '\r\n'.join(result.split('\r\n')[1:-1])
-        return info
+        return '\r\n'.join(result.split('\r\n')[:-1])
 
 
 class HuaweiISCSIDriver(driver.ISCSIDriver):
     """Huawei T series and Dorado iSCSI volume driver."""
+
+    VERSION = "1.0.0"
 
     def __init__(self, *args, **kwargs):
         super(HuaweiISCSIDriver, self).__init__(*args, **kwargs)
@@ -107,10 +137,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         self.device_type = {}
         self.login_info = {}
         self.hostgroup_id = None
-
-        # Flag to tell whether the other controller is available
-        # if the current controller can not be connected to.
-        self.controller_alterable = True
+        self.ssh_pool = None
 
     def do_setup(self, context):
         """Check config file."""
@@ -147,7 +174,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             root = self._read_xml()
             pool_node = root.findall('LUN/StoragePool')
             if not pool_node:
-                err_msg = (_('_get_device_type: Storage Pool must be'
+                err_msg = (_('_get_device_type: Storage Pool must be '
                              'configured.'))
                 LOG.error(err_msg)
                 raise exception.VolumeBackendAPIException(data=err_msg)
@@ -177,7 +204,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         if volume_id is not None:
             self._delete_volume(volume_name, volume_id)
         else:
-            err_msg = (_('delete_volume:No need to delete volume.'
+            err_msg = (_('delete_volume:No need to delete volume. '
                          'Volume %(name)s does not exist.')
                        % {'name': volume['name']})
             LOG.error(err_msg)
@@ -225,17 +252,17 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                 break
         if not target_ip:
             if not iscsi_conf['DefaultTargetIP']:
-                err_msg = (_('initialize_connection:Failed to find target ip'
-                             'for initiator:%(initiatorname)s,'
+                err_msg = (_('initialize_connection:Failed to find target ip '
+                             'for initiator:%(initiatorname)s, '
                              'please check config file.')
                            % {'initiatorname': initiator_name})
                 LOG.error(err_msg)
                 raise exception.VolumeBackendAPIException(data=err_msg)
             target_ip = iscsi_conf['DefaultTargetIP']
 
-        target_iqn = self._get_tgt_iqn(target_ip)
+        (target_iqn, controller) = self._get_tgt_iqn(target_ip)
         if not target_iqn:
-            err_msg = (_('initialize_connection:Failed to find target iSCSI'
+            err_msg = (_('initialize_connection:Failed to find target iSCSI '
                          'iqn. Target IP:%(ip)s')
                        % {'ip': target_ip})
             LOG.error(err_msg)
@@ -273,7 +300,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         if not portadded:
             self._add_hostport(port_name, host_id, port_info)
 
-        LOG.debug(_('initialize_connection:host name: %(host)s,'
+        LOG.debug(_('initialize_connection:host name: %(host)s, '
                     'initiator name: %(ini)s, '
                     'hostport name: %(port)s')
                   % {'host': host_name,
@@ -308,6 +335,10 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         if not hostlun_id:
             self._map_lun(lun_id, host_id, new_hostlun_id)
             hostlun_id = self._get_hostlunid(host_id, lun_id)
+
+        # Change lun ownning controller for better performance.
+        if self._get_lun_controller(lun_id) != controller:
+            self._change_lun_controller(lun_id, controller)
 
         # Return iSCSI properties.
         properties = {}
@@ -349,7 +380,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         # Delete host map.
         lun_id = self._find_lun(volume_name)
         if lun_id is None:
-            err_msg = (_('terminate_connection:volume does not exist.'
+            err_msg = (_('terminate_connection:volume does not exist. '
                          'volume name:%(volume)s')
                        % {'volume': volume_name})
             LOG.error(err_msg)
@@ -369,7 +400,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             mapnum = mapnum - 1
         else:
             LOG.error(_('terminate_connection:No map between host '
-                        'and volume. Host name:%(hostname)s,'
+                        'and volume. Host name:%(hostname)s, '
                         'volume name:%(volumename)s.')
                       % {'hostname': host_name,
                          'volumename': volume_name})
@@ -419,7 +450,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
 
         lun_id = self._find_lun(volume_name)
         if lun_id is None:
-            err_msg = (_('create_snapshot:Volume does not exist.'
+            err_msg = (_('create_snapshot:Volume does not exist. '
                          'Volume name:%(name)s')
                        % {'name': volume_name})
             LOG.error(err_msg)
@@ -428,7 +459,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         self._create_snapshot(snapshot_name, lun_id)
         snapshot_id = self._find_snapshot(snapshot_name)
         if not snapshot_id:
-            err_msg = (_('create_snapshot:Snapshot does not exist.'
+            err_msg = (_('create_snapshot:Snapshot does not exist. '
                          'Snapshot name:%(name)s')
                        % {'name': snapshot_name})
             LOG.error(err_msg)
@@ -488,8 +519,8 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
 
         snapshot_id = self._find_snapshot(snapshot_name)
         if snapshot_id is None:
-            err_msg = (_('create_volume_from_snapshot:Snapshot does not exist.'
-                         'Snapshot name:%(name)s')
+            err_msg = (_('create_volume_from_snapshot:Snapshot '
+                         'does not exist. Snapshot name:%(name)s')
                        % {'name': snapshot_name})
             LOG.error(err_msg)
             raise exception.VolumeBackendAPIException(data=err_msg)
@@ -517,12 +548,12 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         self._delete_luncopy(luncopy_id)
 
     def get_volume_stats(self, refresh=False):
-        """Get volume status.
+        """Get volume stats.
 
         If 'refresh' is True, run update the stats first.
         """
         if refresh:
-            self._update_volume_status()
+            self._update_volume_stats()
 
         return self._stats
 
@@ -563,12 +594,29 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
     def _get_login_info(self):
         """Get login IP, username and password from config file."""
         logininfo = {}
-        root = self._read_xml()
         try:
+            filename = self.configuration.cinder_huawei_conf_file
+            tree = ET.parse(filename)
+            root = tree.getroot()
             logininfo['ControllerIP0'] = root.findtext('Storage/ControllerIP0')
             logininfo['ControllerIP1'] = root.findtext('Storage/ControllerIP1')
-            logininfo['UserName'] = root.findtext('Storage/UserName')
-            logininfo['UserPassword'] = root.findtext('Storage/UserPassword')
+
+            need_encode = False
+            for key in ['UserName', 'UserPassword']:
+                node = root.find('Storage/%s' % key)
+                node_text = node.text
+                if node_text.find('!$$$') == 0:
+                    logininfo[key] = base64.b64decode(node_text[4:])
+                else:
+                    logininfo[key] = node_text
+                    node.text = '!$$$' + base64.b64encode(node_text)
+                    need_encode = True
+            if need_encode:
+                try:
+                    tree.write(filename, 'UTF-8')
+                except Exception as err:
+                    LOG.error(_('Write login information to xml error. %s')
+                              % err)
 
         except Exception as err:
             LOG.error(_('_get_login_info error. %s') % err)
@@ -593,7 +641,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             if luntype in ['Thick', 'Thin']:
                 lunsetinfo['LUNType'] = luntype
             elif luntype:
-                err_msg = (_('Config file is wrong. LUNType must be "Thin"'
+                err_msg = (_('Config file is wrong. LUNType must be "Thin" '
                              ' or "Thick". LUNType:%(type)s')
                            % {'type': luntype})
                 raise exception.VolumeBackendAPIException(data=err_msg)
@@ -691,7 +739,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         if maxpoolid is not None:
             return maxpoolid
         else:
-            err_msg = (_('_get_maximum_pool:maxpoolid is None.'
+            err_msg = (_('_get_maximum_pool:maxpoolid is None. '
                          'Please check config file and make sure '
                          'the "Name" in "StoragePool" is right.'))
             raise exception.VolumeBackendAPIException(data=err_msg)
@@ -719,45 +767,75 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         If the connection to first controller time out,
         try to connect to the other controller.
         """
+        LOG.debug(_('CLI command:%s') % cmd)
+        connect_times = 0
+        ip0 = self.login_info['ControllerIP0']
+        ip1 = self.login_info['ControllerIP1']
         user = self.login_info['UserName']
         pwd = self.login_info['UserPassword']
+        if not self.ssh_pool:
+            self.ssh_pool = SSHConn(ip0, 22, 30, user, pwd)
+        ssh_client = None
         while True:
-            if self.controller_alterable:
-                ip = self.login_info['ControllerIP0']
-            else:
-                ip = self.login_info['ControllerIP1']
-
+            if connect_times == 1:
+                # Switch to the other controller.
+                self.ssh_pool.lock.acquire()
+                if ssh_client:
+                    if ssh_client.server_ip == self.ssh_pool.ip:
+                        if self.ssh_pool.ip == ip0:
+                            self.ssh_pool.ip = ip1
+                        else:
+                            self.ssh_pool.ip = ip0
+                    # Create a new client.
+                    if ssh_client.chan:
+                        ssh_client.chan.close()
+                        ssh_client.chan = None
+                        ssh_client.server_ip = None
+                        ssh_client.close()
+                        ssh_client = None
+                        ssh_client = self.ssh_pool.create()
+                else:
+                    self.ssh_pool.ip = ip1
+                self.ssh_pool.lock.release()
             try:
-                ssh = SSHConnection(ip, 22, user, pwd, 30)
-                ssh.connect()
+                if not ssh_client:
+                    ssh_client = self.ssh_pool.get()
+                # "server_ip" shows controller connecting with the ssh client.
+                if ('server_ip' not in ssh_client.__dict__ or
+                        not ssh_client.server_ip):
+                    self.ssh_pool.lock.acquire()
+                    ssh_client.server_ip = self.ssh_pool.ip
+                    self.ssh_pool.lock.release()
+                # An SSH client owns one "chan".
+                if ('chan' not in ssh_client.__dict__ or
+                        not ssh_client.chan):
+                    ssh_client.chan =\
+                        utils.create_channel(ssh_client, 600, 800)
+
                 while True:
-                    out = ssh.send_cmd(cmd, 30)
+                    ssh_client.chan.send(cmd + '\n')
+                    out = self.ssh_pool.ssh_read(ssh_client.chan, cmd, 20)
                     if out.find('(y/n)') > -1:
                         cmd = 'y'
                     else:
                         break
-                ssh.close()
+                self.ssh_pool.put(ssh_client)
+
+                index = out.find(user + ':/>')
+                if index > -1:
+                    return out[index:]
+                else:
+                    return out
+
             except Exception as err:
-                if ((not self.controller_alterable) and
-                        (str(err).find('timed out') > -1)):
-                    self.controller_alterable = False
-
-                    LOG.debug(_('_execute_cli:Connect to controller0 %(ctr0)s'
-                                ' time out.Try to Connect to controller1 '
-                                '%(ctr1)s.')
-                              % {'ctr0': self.login_info['ControllerIP0'],
-                                 'ctr1': self.login_info['ControllerIP1']})
-
+                if connect_times < 1:
+                    connect_times += 1
                     continue
                 else:
+                    if ssh_client:
+                        self.ssh_pool.remove(ssh_client)
                     LOG.error(_('_execute_cli:%s') % err)
                     raise exception.VolumeBackendAPIException(data=err)
-
-            index = out.find(user + ':/>')
-            if index > -1:
-                return out[index:]
-            else:
-                return out
 
     def _name_translate(self, name):
         """Form new names because of the 32-character limit on names."""
@@ -826,7 +904,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                       'hostname': hostname})
         out = self._execute_cli(cli_cmd)
         if not re.search('command operates successfully', out):
-            err_msg = (_('_add_host:Failed to add host to hostgroup.'
+            err_msg = (_('_add_host:Failed to add host to hostgroup. '
                          'host name:%(host)s '
                          'hostgroup id:%(hostgroup)s '
                          'out:%(out)s')
@@ -852,7 +930,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                    % {'name': ininame})
         out = self._execute_cli(cli_cmd)
         if not re.search('command operates successfully', out):
-            err_msg = (_('_add_initiator:Failed to add initiator.'
+            err_msg = (_('_add_initiator:Failed to add initiator. '
                          'initiator name:%(name)s '
                          'out:%(out)s')
                        % {'name': ininame,
@@ -866,7 +944,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                    % {'name': ininame})
         out = self._execute_cli(cli_cmd)
         if not re.search('command operates successfully', out):
-            err_msg = (_('_delete_initiator:ERROE:Failed to delete initiator.'
+            err_msg = (_('_delete_initiator:ERROE:Failed to delete initiator. '
                          'initiator name:%(name)s '
                          'out:%(out)s')
                        % {'name': ininame,
@@ -917,9 +995,9 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         out = self._execute_cli(cli_cmd)
         if not re.search('command operates successfully', out):
             err_msg = (_('_add_hostport:Failed to add hostport. '
-                         'port name:%(port)s'
+                         'port name:%(port)s '
                          'port information:%(info)s '
-                         'host id:%(host)s'
+                         'host id:%(host)s '
                          'out:%(out)s')
                        % {'port': portname,
                           'info': portinfo,
@@ -946,7 +1024,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         out = self._execute_cli(cli_cmd)
         en = out.split('\r\n')
         if len(en) < 4:
-            return None
+            return (None, None)
 
         index = en[4].find('iqn')
         iqn_prefix = en[4][index:]
@@ -976,9 +1054,9 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
 
             LOG.debug(_('_get_tgt_iqn:iSCSI target iqn is:%s') % iqn)
 
-            return iqn
+            return (iqn, iscsiip_info['ctrid'])
         else:
-            return None
+            return (None, None)
 
     def _get_iscsi_ip_info(self, iscsiip):
         """Get iSCSI IP infomation of storage device."""
@@ -1011,10 +1089,10 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                       'hostlunid': new_hostlun_id})
         out = self._execute_cli(cli_cmd)
         if not re.search('command operates successfully', out):
-            err_msg = (_('_map_lun:Failed to add hostmap.'
-                         'hostid:%(host)s'
-                         'lunid:%(lun)s'
-                         'hostlunid:%(hostlunid)s.'
+            err_msg = (_('_map_lun:Failed to add hostmap. '
+                         'hostid:%(host)s '
+                         'lunid:%(lun)s '
+                         'hostlunid:%(hostlunid)s '
                          'out:%(out)s')
                        % {'host': hostid,
                           'lun': lunid,
@@ -1067,7 +1145,8 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                    % {'hostid': hostid})
         out = self._execute_cli(cli_cmd)
         if not re.search('command operates successfully', out):
-            err_msg = (_('_delete_host: Failed delete host.host id:%(hostid)s.'
+            err_msg = (_('_delete_host: Failed delete host. '
+                         'host id:%(hostid)s '
                          'out:%(out)s')
                        % {'hostid': hostid,
                           'out': out})
@@ -1078,7 +1157,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
         """Get map infomation of the given host.
 
         This method return a map information list. Every item in the list
-        is a dictionary. The dictionarie includes three keys: mapid,
+        is a dictionary. The dictionary includes three keys: mapid,
         devlunid, hostlunid. These items are sorted by hostlunid value
         from small to large.
         """
@@ -1306,7 +1385,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             if luncopy_info['state'] == 'Complete':
                 break
             elif luncopy_info['status'] != 'Normal':
-                err_msg = (_('_wait_for_luncopy:LUNcopy status isnot normal. '
+                err_msg = (_('_wait_for_luncopy:LUNcopy status is not normal. '
                              'LUNcopy name:%(luncopyname)s')
                            % {'luncopyname': luncopyname})
                 LOG.error(err_msg)
@@ -1376,13 +1455,39 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                 return r[1]
         return None
 
+    def _get_lun_controller(self, lun_id):
+        cli_cmd = ('showlun -lun %s' % lun_id)
+        out = self._execute_cli(cli_cmd)
+        en = out.split('\r\n')
+        if len(en) <= 4:
+            return None
+
+        if "Dorado2100 G2" == self.device_type['type']:
+            return en[10].split()[3]
+        else:
+            return en[12].split()[3]
+
+    def _change_lun_controller(self, lun_id, controller):
+        cli_cmd = ('chglun -lun %s -c %s' % (lun_id, controller))
+        out = self._execute_cli(cli_cmd)
+        if not re.search('command operates successfully', out):
+            err_msg = (_('_change_lun_controller:Failed to change lun owning '
+                         'controller. lun id:%(lunid)s. '
+                         'new controller:%(controller)s. '
+                         'out:%(out)s')
+                       % {'lunid': lun_id,
+                          'controller': controller,
+                          'out': out})
+            LOG.error(err_msg)
+            raise exception.VolumeBackendAPIException(data=err_msg)
+
     def _is_resource_pool_enough(self):
         """Check whether resource pools' valid size is more than 1G."""
         cli_cmd = ('showrespool')
         out = self._execute_cli(cli_cmd)
         en = re.split('\r\n', out)
         if len(en) <= 6:
-            LOG.error(_('_is_resource_pool_enough:Resource pool for snapshot'
+            LOG.error(_('_is_resource_pool_enough:Resource pool for snapshot '
                         'not be added.'))
             return False
         resource_pools = []
@@ -1398,14 +1503,15 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                 return False
         return True
 
-    def _update_volume_status(self):
-        """Retrieve status info from volume group."""
+    def _update_volume_stats(self):
+        """Retrieve stats info from volume group."""
 
-        LOG.debug(_("Updating volume status"))
+        LOG.debug(_("Updating volume stats"))
         data = {}
-        data['volume_backend_name'] = 'HuaweiISCSIDriver'
+        backend_name = self.configuration.safe_get('volume_backend_name')
+        data["volume_backend_name"] = backend_name or 'HuaweiISCSIDriver'
         data['vendor_name'] = 'Huawei'
-        data['driver_version'] = '1.0'
+        data['driver_version'] = self.VERSION
         data['storage_protocol'] = 'iSCSI'
 
         data['total_capacity_gb'] = 'infinite'
@@ -1425,7 +1531,7 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
             lun_type = 'Thick'
         poolinfo_dev = self._find_pool_info(lun_type)
         pools_conf = root.findall('LUN/StoragePool')
-        total_free_capacity = 0
+        total_free_capacity = 0.0
         for poolinfo in poolinfo_dev:
             if self.device_type['type'] == 'Dorado2100 G2':
                 total_free_capacity += float(poolinfo[2])
@@ -1444,4 +1550,4 @@ class HuaweiISCSIDriver(driver.ISCSIDriver):
                         total_free_capacity += float(poolinfo[4])
                         break
 
-        return str(int(total_free_capacity / 1024))
+        return total_free_capacity / 1024

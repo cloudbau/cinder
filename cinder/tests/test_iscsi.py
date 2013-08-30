@@ -19,8 +19,9 @@ import shutil
 import string
 import tempfile
 
+from cinder.brick.iscsi import iscsi
 from cinder import test
-from cinder.volume import iscsi
+from cinder.volume import utils as volume_utils
 
 
 class TargetAdminTestCase(object):
@@ -33,6 +34,7 @@ class TargetAdminTestCase(object):
         self.lun = 10
         self.path = '/foo'
         self.vol_id = 'blaa'
+        self.vol_name = 'volume-blaa'
 
         self.script_template = None
         self.stubs.Set(os.path, 'isfile', lambda _: True)
@@ -41,7 +43,7 @@ class TargetAdminTestCase(object):
         self.stubs.Set(iscsi.LioAdm, '_get_target', self.fake_get_target)
         self.stubs.Set(iscsi.LioAdm, '__init__', self.fake_init)
 
-    def fake_init(obj):
+    def fake_init(obj, root_helper):
         return
 
     def fake_get_target(obj, iqn):
@@ -78,12 +80,13 @@ class TargetAdminTestCase(object):
         self.verify_cmds(cmds)
 
     def run_commands(self):
-        tgtadm = iscsi.get_target_admin()
+        tgtadm = iscsi.get_target_admin(None)
         tgtadm.set_execute(self.fake_execute)
         tgtadm.create_iscsi_target(self.target_name, self.tid,
                                    self.lun, self.path)
         tgtadm.show_target(self.tid, iqn=self.target_name)
-        tgtadm.remove_iscsi_target(self.tid, self.lun, self.vol_id)
+        tgtadm.remove_iscsi_target(self.tid, self.lun, self.vol_id,
+                                   self.vol_name)
 
     def test_target_admin(self):
         self.clear_cmds()
@@ -127,6 +130,55 @@ class IetAdmTestCase(test.TestCase, TargetAdminTestCase):
             'ietadm --op delete --tid=%(tid)s'])
 
 
+class IetAdmBlockIOTestCase(test.TestCase, TargetAdminTestCase):
+
+    def setUp(self):
+        super(IetAdmBlockIOTestCase, self).setUp()
+        TargetAdminTestCase.setUp(self)
+        self.flags(iscsi_helper='ietadm')
+        self.flags(iscsi_iotype='blockio')
+        self.script_template = "\n".join([
+            'ietadm --op new --tid=%(tid)s --params Name=%(target_name)s',
+            'ietadm --op new --tid=%(tid)s --lun=%(lun)s '
+            '--params Path=%(path)s,Type=blockio',
+            'ietadm --op show --tid=%(tid)s',
+            'ietadm --op delete --tid=%(tid)s --lun=%(lun)s',
+            'ietadm --op delete --tid=%(tid)s'])
+
+
+class IetAdmFileIOTestCase(test.TestCase, TargetAdminTestCase):
+
+    def setUp(self):
+        super(IetAdmFileIOTestCase, self).setUp()
+        TargetAdminTestCase.setUp(self)
+        self.flags(iscsi_helper='ietadm')
+        self.flags(iscsi_iotype='fileio')
+        self.script_template = "\n".join([
+            'ietadm --op new --tid=%(tid)s --params Name=%(target_name)s',
+            'ietadm --op new --tid=%(tid)s --lun=%(lun)s '
+            '--params Path=%(path)s,Type=fileio',
+            'ietadm --op show --tid=%(tid)s',
+            'ietadm --op delete --tid=%(tid)s --lun=%(lun)s',
+            'ietadm --op delete --tid=%(tid)s'])
+
+
+class IetAdmAutoIOTestCase(test.TestCase, TargetAdminTestCase):
+
+    def setUp(self):
+        super(IetAdmAutoIOTestCase, self).setUp()
+        TargetAdminTestCase.setUp(self)
+        self.stubs.Set(iscsi.IetAdm, '_is_block', lambda a, b: True)
+        self.flags(iscsi_helper='ietadm')
+        self.flags(iscsi_iotype='auto')
+        self.script_template = "\n".join([
+            'ietadm --op new --tid=%(tid)s --params Name=%(target_name)s',
+            'ietadm --op new --tid=%(tid)s --lun=%(lun)s '
+            '--params Path=%(path)s,Type=blockio',
+            'ietadm --op show --tid=%(tid)s',
+            'ietadm --op delete --tid=%(tid)s --lun=%(lun)s',
+            'ietadm --op delete --tid=%(tid)s'])
+
+
 class LioAdmTestCase(test.TestCase, TargetAdminTestCase):
 
     def setUp(self):
@@ -136,5 +188,5 @@ class LioAdmTestCase(test.TestCase, TargetAdminTestCase):
         self.flags(iscsi_helper='lioadm')
         self.script_template = "\n".join([
             'rtstool create '
-                '/foo iqn.2011-09.org.foo.bar:blaa test_id test_pass',
+            '/foo iqn.2011-09.org.foo.bar:blaa test_id test_pass',
             'rtstool delete iqn.2010-10.org.openstack:volume-blaa'])

@@ -29,10 +29,11 @@ Programming HowTos and Tutorials
     development.environment
     unit_tests
     addmethod.openstackapi
+    drivers
 
 
 Background Concepts for Cinder
-----------------------------
+------------------------------
 .. toctree::
    :maxdepth: 3
 

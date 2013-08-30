@@ -17,9 +17,11 @@
 
 """Tests For miscellaneous util methods used with volume."""
 
+
+from oslo.config import cfg
+
 from cinder import context
 from cinder import db
-from cinder import flags
 from cinder.openstack.common import importutils
 from cinder.openstack.common import log as logging
 from cinder.openstack.common.notifier import api as notifier_api
@@ -29,7 +31,8 @@ from cinder.volume import utils as volume_utils
 
 
 LOG = logging.getLogger(__name__)
-FLAGS = flags.FLAGS
+
+CONF = cfg.CONF
 
 
 class UsageInfoTestCase(test.TestCase):
@@ -45,7 +48,7 @@ class UsageInfoTestCase(test.TestCase):
         self.flags(connection_type='fake',
                    host='fake',
                    notification_driver=[test_notifier.__name__])
-        self.volume = importutils.import_object(FLAGS.volume_manager)
+        self.volume = importutils.import_object(CONF.volume_manager)
         self.user_id = 'fake'
         self.project_id = 'fake'
         self.snapshot_id = 'fake'
@@ -63,8 +66,8 @@ class UsageInfoTestCase(test.TestCase):
         vol['snapshot_id'] = self.snapshot_id
         vol['user_id'] = self.user_id
         vol['project_id'] = self.project_id
-        vol['host'] = FLAGS.host
-        vol['availability_zone'] = FLAGS.storage_availability_zone
+        vol['host'] = CONF.host
+        vol['availability_zone'] = CONF.storage_availability_zone
         vol['status'] = "creating"
         vol['attach_status'] = "detached"
         vol['size'] = self.volume_size
@@ -115,3 +118,41 @@ class UsageInfoTestCase(test.TestCase):
                                  self.MULTI_AT_BACKEND)
         self.assertEquals(volume_utils.get_host_from_queue(fullname),
                           self.HOSTIP)
+
+
+class LVMVolumeDriverTestCase(test.TestCase):
+    def test_convert_blocksize_option(self):
+        # Test valid volume_dd_blocksize
+        CONF.set_override('volume_dd_blocksize', '10M')
+        bs, count = volume_utils._calculate_count(1024)
+        self.assertEquals(bs, '10M')
+        self.assertEquals(count, 103)
+
+        CONF.set_override('volume_dd_blocksize', '1xBBB')
+        bs, count = volume_utils._calculate_count(1024)
+        self.assertEquals(bs, '1M')
+        self.assertEquals(count, 1024)
+
+        # Test 'volume_dd_blocksize' with fraction
+        CONF.set_override('volume_dd_blocksize', '1.3M')
+        bs, count = volume_utils._calculate_count(1024)
+        self.assertEquals(bs, '1M')
+        self.assertEquals(count, 1024)
+
+        # Test zero-size 'volume_dd_blocksize'
+        CONF.set_override('volume_dd_blocksize', '0M')
+        bs, count = volume_utils._calculate_count(1024)
+        self.assertEquals(bs, '1M')
+        self.assertEquals(count, 1024)
+
+        # Test negative 'volume_dd_blocksize'
+        CONF.set_override('volume_dd_blocksize', '-1M')
+        bs, count = volume_utils._calculate_count(1024)
+        self.assertEquals(bs, '1M')
+        self.assertEquals(count, 1024)
+
+        # Test non-digital 'volume_dd_blocksize'
+        CONF.set_override('volume_dd_blocksize', 'ABM')
+        bs, count = volume_utils._calculate_count(1024)
+        self.assertEquals(bs, '1M')
+        self.assertEquals(count, 1024)

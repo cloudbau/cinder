@@ -19,6 +19,8 @@
 
 """Utility methods for working with WSGI servers."""
 
+from __future__ import print_function
+
 import errno
 import os
 import socket
@@ -36,9 +38,9 @@ import webob.dec
 import webob.exc
 
 from cinder import exception
-from cinder import flags
 from cinder.openstack.common import log as logging
 from cinder import utils
+
 
 socket_opts = [
     cfg.IntOpt('backlog',
@@ -65,7 +67,6 @@ socket_opts = [
 CONF = cfg.CONF
 CONF.register_opts(socket_opts)
 
-FLAGS = flags.FLAGS
 LOG = logging.getLogger(__name__)
 
 
@@ -155,7 +156,7 @@ class Server(object):
                 if use_ssl:
                     sock = wrap_ssl(sock)
 
-            except socket.error, err:
+            except socket.error as err:
                 if err.args[0] != errno.EADDRINUSE:
                     raise
                 eventlet.sleep(0.1)
@@ -204,7 +205,8 @@ class Server(object):
                                         backlog=backlog)
         self._server = eventlet.spawn(self._start)
         (self._host, self._port) = self._socket.getsockname()[0:2]
-        LOG.info(_("Started %(name)s on %(_host)s:%(_port)s") % self.__dict__)
+        LOG.info(_("Started %(name)s on %(host)s:%(port)s") %
+                 {'name': self.name, 'host': self.host, 'port': self.port})
 
     @property
     def host(self):
@@ -382,16 +384,16 @@ class Debug(Middleware):
 
     @webob.dec.wsgify(RequestClass=Request)
     def __call__(self, req):
-        print ('*' * 40) + ' REQUEST ENVIRON'
+        print(('*' * 40) + ' REQUEST ENVIRON')
         for key, value in req.environ.items():
-            print key, '=', value
-        print
+            print(key, '=', value)
+        print()
         resp = req.get_response(self.application)
 
-        print ('*' * 40) + ' RESPONSE HEADERS'
+        print(('*' * 40) + ' RESPONSE HEADERS')
         for (key, value) in resp.headers.iteritems():
-            print key, '=', value
-        print
+            print(key, '=', value)
+        print()
 
         resp.app_iter = self.print_generator(resp.app_iter)
 
@@ -400,12 +402,12 @@ class Debug(Middleware):
     @staticmethod
     def print_generator(app_iter):
         """Iterator that prints the contents of a wrapper string."""
-        print ('*' * 40) + ' BODY'
+        print(('*' * 40) + ' BODY')
         for part in app_iter:
             sys.stdout.write(part)
             sys.stdout.flush()
             yield part
-        print
+        print()
 
 
 class Router(object):
@@ -475,7 +477,7 @@ class Loader(object):
         :returns: None
 
         """
-        config_path = config_path or FLAGS.api_paste_config
+        config_path = config_path or CONF.api_paste_config
         self.config_path = utils.find_config(config_path)
 
     def load_app(self, name):

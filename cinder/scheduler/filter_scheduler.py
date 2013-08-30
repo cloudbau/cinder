@@ -20,17 +20,14 @@ You can customize this scheduler by specifying your own volume Filters and
 Weighing Functions.
 """
 
-import operator
+from oslo.config import cfg
 
 from cinder import exception
-from cinder import flags
-from cinder.openstack.common import importutils
 from cinder.openstack.common import log as logging
 from cinder.scheduler import driver
 from cinder.scheduler import scheduler_options
 
-
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 
 
@@ -61,6 +58,7 @@ class FilterScheduler(driver.Scheduler):
         filter_properties['availability_zone'] = vol.get('availability_zone')
         filter_properties['user_id'] = vol.get('user_id')
         filter_properties['metadata'] = vol.get('metadata')
+        filter_properties['qos_specs'] = vol.get('qos_specs')
 
     def schedule_create_volume(self, context, request_spec, filter_properties):
         weighed_host = self._schedule(context, request_spec,
@@ -88,6 +86,20 @@ class FilterScheduler(driver.Scheduler):
                                          snapshot_id=snapshot_id,
                                          image_id=image_id)
 
+    def host_passes_filters(self, context, host, request_spec,
+                            filter_properties):
+        """Check if the specified host passes the filters."""
+        weighed_hosts = self._get_weighted_candidates(context, request_spec,
+                                                      filter_properties)
+        for weighed_host in weighed_hosts:
+            host_state = weighed_host.obj
+            if host_state.host == host:
+                return host_state
+
+        msg = (_('cannot place volume %(id)s on %(host)s')
+               % {'id': request_spec['volume_id'], 'host': host})
+        raise exception.NoValidHost(reason=msg)
+
     def _post_select_populate_filter_properties(self, filter_properties,
                                                 host_state):
         """Add additional information to the filter properties after a host has
@@ -108,7 +120,7 @@ class FilterScheduler(driver.Scheduler):
         hosts.append(host)
 
     def _max_attempts(self):
-        max_attempts = FLAGS.scheduler_max_attempts
+        max_attempts = CONF.scheduler_max_attempts
         if max_attempts < 1:
             msg = _("Invalid value for 'scheduler_max_attempts', "
                     "must be >=1")
@@ -129,7 +141,11 @@ class FilterScheduler(driver.Scheduler):
 
         last_host = hosts[-1]
         msg = _("Error scheduling %(volume_id)s from last vol-service: "
-                "%(last_host)s : %(exc)s") % locals()
+                "%(last_host)s : %(exc)s") % {
+                    'volume_id': volume_id,
+                    'last_host': last_host,
+                    'exc': exc,
+                }
         LOG.error(msg)
 
     def _populate_retry(self, filter_properties, properties):
@@ -158,10 +174,14 @@ class FilterScheduler(driver.Scheduler):
 
         if retry['num_attempts'] > max_attempts:
             msg = _("Exceeded max scheduling attempts %(max_attempts)d for "
-                    "volume %(volume_id)s") % locals()
+                    "volume %(volume_id)s") % {
+                        'max_attempts': max_attempts,
+                        'volume_id': volume_id,
+                    }
             raise exception.NoValidHost(reason=msg)
 
-    def _schedule(self, context, request_spec, filter_properties=None):
+    def _get_weighted_candidates(self, context, request_spec,
+                                 filter_properties=None):
         """Returns a list of hosts that meet the required specs,
         ordered by their fitness.
         """
@@ -203,14 +223,22 @@ class FilterScheduler(driver.Scheduler):
         hosts = self.host_manager.get_filtered_hosts(hosts,
                                                      filter_properties)
         if not hosts:
-            return None
+            return []
 
-        LOG.debug(_("Filtered %(hosts)s") % locals())
+        LOG.debug(_("Filtered %s") % hosts)
         # weighted_host = WeightedHost() ... the best
         # host for the job.
         weighed_hosts = self.host_manager.get_weighed_hosts(hosts,
                                                             filter_properties)
+        return weighed_hosts
+
+    def _schedule(self, context, request_spec, filter_properties=None):
+        weighed_hosts = self._get_weighted_candidates(context, request_spec,
+                                                      filter_properties)
+        if not weighed_hosts:
+            return None
         best_host = weighed_hosts[0]
-        LOG.debug(_("Choosing %(best_host)s") % locals())
+        LOG.debug(_("Choosing %s") % best_host)
+        volume_properties = request_spec['volume_properties']
         best_host.obj.consume_from_volume(volume_properties)
         return best_host

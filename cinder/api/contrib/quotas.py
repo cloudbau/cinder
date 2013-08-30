@@ -29,8 +29,8 @@ from cinder import quota
 QUOTAS = quota.QUOTAS
 
 
-authorize_update = extensions.extension_authorizer('compute', 'quotas:update')
-authorize_show = extensions.extension_authorizer('compute', 'quotas:show')
+authorize_update = extensions.extension_authorizer('volume', 'quotas:update')
+authorize_show = extensions.extension_authorizer('volume', 'quotas:show')
 
 
 class QuotaTemplate(xmlutil.TemplateBuilder):
@@ -58,6 +58,10 @@ class QuotaSetsController(object):
         return dict(quota_set=result)
 
     def _validate_quota_limit(self, limit):
+        if not isinstance(limit, int):
+            msg = _("Quota limit must be specified as an integer value.")
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
         # NOTE: -1 is a flag value for unlimited
         if limit < -1:
             msg = _("Quota limit must be -1 or greater.")
@@ -89,8 +93,8 @@ class QuotaSetsController(object):
         project_id = id
         for key in body['quota_set'].keys():
             if key in QUOTAS:
+                self._validate_quota_limit(body['quota_set'][key])
                 value = int(body['quota_set'][key])
-                self._validate_quota_limit(value)
                 try:
                     db.quota_update(context, project_id, key, value)
                 except exception.ProjectQuotaNotFound:
@@ -111,7 +115,7 @@ class Quotas(extensions.ExtensionDescriptor):
 
     name = "Quotas"
     alias = "os-quota-sets"
-    namespace = "http://docs.openstack.org/compute/ext/quotas-sets/api/v1.1"
+    namespace = "http://docs.openstack.org/volume/ext/quotas-sets/api/v1.1"
     updated = "2011-08-08T00:00:00+00:00"
 
     def get_resources(self):

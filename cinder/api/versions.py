@@ -15,15 +15,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+
 import datetime
+
 from lxml import etree
+from oslo.config import cfg
 
 from cinder.api.openstack import wsgi
 from cinder.api.views import versions as views_versions
 from cinder.api import xmlutil
 
 
-VERSIONS = {
+CONF = cfg.CONF
+
+
+_KNOWN_VERSIONS = {
     "v2.0": {
         "id": "v2.0",
         "status": "CURRENT",
@@ -84,8 +90,18 @@ VERSIONS = {
             }
         ],
     }
-
 }
+
+
+def get_supported_versions():
+    versions = {}
+
+    if CONF.enable_v1_api:
+        versions['v1.0'] = _KNOWN_VERSIONS['v1.0']
+    if CONF.enable_v2_api:
+        versions['v2.0'] = _KNOWN_VERSIONS['v2.0']
+
+    return versions
 
 
 class MediaTypesTemplateElement(xmlutil.TemplateElement):
@@ -236,14 +252,14 @@ class Versions(wsgi.Resource):
     def index(self, req):
         """Return all versions."""
         builder = views_versions.get_view_builder(req)
-        return builder.build_versions(VERSIONS)
+        return builder.build_versions(get_supported_versions())
 
     @wsgi.serializers(xml=ChoicesTemplate)
     @wsgi.response(300)
     def multi(self, req):
         """Return multiple choices."""
         builder = views_versions.get_view_builder(req)
-        return builder.build_choices(VERSIONS, req)
+        return builder.build_choices(get_supported_versions(), req)
 
     def get_action_args(self, request_environment):
         """Parse dictionary created by routes library."""
@@ -261,7 +277,7 @@ class VolumeVersionV1(object):
                       atom=VersionAtomSerializer)
     def show(self, req):
         builder = views_versions.get_view_builder(req)
-        return builder.build_version(VERSIONS['v1.0'])
+        return builder.build_version(_KNOWN_VERSIONS['v1.0'])
 
 
 def create_resource():

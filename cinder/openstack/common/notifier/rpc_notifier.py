@@ -16,7 +16,7 @@
 from oslo.config import cfg
 
 from cinder.openstack.common import context as req_context
-from cinder.openstack.common.gettextutils import _
+from cinder.openstack.common.gettextutils import _  # noqa
 from cinder.openstack.common import log as logging
 from cinder.openstack.common import rpc
 
@@ -24,14 +24,14 @@ LOG = logging.getLogger(__name__)
 
 notification_topic_opt = cfg.ListOpt(
     'notification_topics', default=['notifications', ],
-    help='AMQP topic used for openstack notifications')
+    help='AMQP topic used for OpenStack notifications')
 
 CONF = cfg.CONF
 CONF.register_opt(notification_topic_opt)
 
 
 def notify(context, message):
-    """Sends a notification via RPC"""
+    """Sends a notification via RPC."""
     if not context:
         context = req_context.get_admin_context()
     priority = message.get('priority',

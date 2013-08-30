@@ -21,6 +21,8 @@
 
 """Installation script for Cinder's development virtualenv."""
 
+from __future__ import print_function
+
 import optparse
 import os
 import subprocess
@@ -48,14 +50,14 @@ def print_help():
 
     Also, make test will automatically use the virtualenv.
     """
-    print help
+    print(help)
 
 
 def main(argv):
     root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     venv = os.path.join(root, '.venv')
-    pip_requires = os.path.join(root, 'tools', 'pip-requires')
-    test_requires = os.path.join(root, 'tools', 'test-requires')
+    pip_requires = os.path.join(root, 'requirements.txt')
+    test_requires = os.path.join(root, 'test-requirements.txt')
     project = 'Cinder'
     py_version = "python%s.%s" % (sys.version_info[0], sys.version_info[1])
     install = install_venv.InstallVenv(root, venv, pip_requires, test_requires,

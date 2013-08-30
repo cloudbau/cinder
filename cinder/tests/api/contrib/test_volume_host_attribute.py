@@ -22,6 +22,7 @@ from lxml import etree
 import webob
 
 from cinder import context
+from cinder import db
 from cinder import test
 from cinder.tests.api import fakes
 from cinder import volume
@@ -41,6 +42,8 @@ def fake_volume_get(*args, **kwargs):
         'volume_type_id': None,
         'snapshot_id': None,
         'project_id': 'fake',
+        'migration_status': None,
+        '_name_id': 'fake2',
     }
 
 
@@ -62,6 +65,8 @@ class VolumeHostAttributeTest(test.TestCase):
         super(VolumeHostAttributeTest, self).setUp()
         self.stubs.Set(volume.API, 'get', fake_volume_get)
         self.stubs.Set(volume.API, 'get_all', fake_volume_get_all)
+        self.stubs.Set(db, 'volume_get', fake_volume_get)
+
         self.UUID = uuid.uuid4()
 
     def test_get_volume_allowed(self):

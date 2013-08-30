@@ -1,7 +1,5 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-# Copyright 2010 United States Government as represented by the
-# Administrator of the National Aeronautics and Space Administration.
+# Copyright (c) 2013 OpenStack, LLC.
+#
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -103,18 +101,20 @@ class APIRouter(base_wsgi.Router):
 
     def _setup_extensions(self, ext_mgr):
         for extension in ext_mgr.get_controller_extensions():
-            ext_name = extension.extension.name
             collection = extension.collection
             controller = extension.controller
 
             if collection not in self.resources:
                 LOG.warning(_('Extension %(ext_name)s: Cannot extend '
-                              'resource %(collection)s: No such resource') %
-                            locals())
+                              'resource %(collection)s: No such resource'),
+                            {'ext_name': extension.extension.name,
+                             'collection': collection})
                 continue
 
             LOG.debug(_('Extension %(ext_name)s extending resource: '
-                        '%(collection)s') % locals())
+                        '%(collection)s'),
+                      {'ext_name': extension.extension.name,
+                       'collection': collection})
 
             resource = self.resources[collection]
             resource.register_actions(controller)
@@ -122,3 +122,13 @@ class APIRouter(base_wsgi.Router):
 
     def _setup_routes(self, mapper, ext_mgr):
         raise NotImplementedError
+
+
+class FaultWrapper(base_wsgi.Middleware):
+
+    def __init__(self, application):
+        LOG.warn(_('cinder.api.openstack:FaultWrapper is deprecated. Please '
+                   'use cinder.api.middleware.fault:FaultWrapper instead.'))
+        # Avoid circular imports from here. Can I just remove this class?
+        from cinder.api.middleware import fault
+        super(FaultWrapper, self).__init__(fault.FaultWrapper(application))

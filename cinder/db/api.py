@@ -32,11 +32,11 @@ these objects be simple dictionaries.
 
 **Related Flags**
 
-:db_backend:  string to lookup in the list of LazyPluggable backends.
-              `sqlalchemy` is the only supported backend right now.
+:backend:  string to lookup in the list of LazyPluggable backends.
+           `sqlalchemy` is the only supported backend right now.
 
-:sql_connection:  string specifying the sqlalchemy connection to use, like:
-                  `sqlite:///var/lib/cinder/cinder.sqlite`.
+:connection:  string specifying the sqlalchemy connection to use, like:
+              `sqlite:///var/lib/cinder/cinder.sqlite`.
 
 :enable_new_services:  when adding a new service to the database, is it in the
                        pool of available hardware (Default: True)
@@ -46,10 +46,15 @@ these objects be simple dictionaries.
 from oslo.config import cfg
 
 from cinder import exception
-from cinder import flags
-from cinder import utils
+from cinder.openstack.common.db import api as db_api
+
 
 db_opts = [
+    # TODO(rpodolyaka): this option is deprecated but still passed to
+    #                   LazyPluggable class which doesn't support retrieving
+    #                   of options put into groups. Nova's version of this
+    #                   class supports this. Perhaps, we should put it to Oslo
+    #                   and then reuse here.
     cfg.StrOpt('db_backend',
                default='sqlalchemy',
                help='The backend to use for db'),
@@ -66,11 +71,12 @@ db_opts = [
                default='backup-%s',
                help='Template string to be used to generate backup names'), ]
 
-FLAGS = flags.FLAGS
-FLAGS.register_opts(db_opts)
+CONF = cfg.CONF
+CONF.register_opts(db_opts)
 
-IMPL = utils.LazyPluggable('db_backend',
-                           sqlalchemy='cinder.db.sqlalchemy.api')
+_BACKEND_MAPPING = {'sqlalchemy': 'cinder.db.sqlalchemy.api'}
+
+IMPL = db_api.DBAPI(backend_mapping=_BACKEND_MAPPING)
 
 
 class NoMoreTargets(exception.CinderException):
@@ -140,34 +146,6 @@ def service_update(context, service_id, values):
 
 
 ###################
-def migration_update(context, id, values):
-    """Update a migration instance."""
-    return IMPL.migration_update(context, id, values)
-
-
-def migration_create(context, values):
-    """Create a migration record."""
-    return IMPL.migration_create(context, values)
-
-
-def migration_get(context, migration_id):
-    """Finds a migration by the id."""
-    return IMPL.migration_get(context, migration_id)
-
-
-def migration_get_by_instance_and_status(context, instance_uuid, status):
-    """Finds a migration by the instance uuid its migrating."""
-    return IMPL.migration_get_by_instance_and_status(context,
-                                                     instance_uuid,
-                                                     status)
-
-
-def migration_get_all_unconfirmed(context, confirm_window):
-    """Finds all unconfirmed migrations within the confirmation window."""
-    return IMPL.migration_get_all_unconfirmed(context, confirm_window)
-
-
-###################
 
 
 def iscsi_target_count_by_host(context, host):
@@ -193,9 +171,10 @@ def volume_allocate_iscsi_target(context, volume_id, host):
     return IMPL.volume_allocate_iscsi_target(context, volume_id, host)
 
 
-def volume_attached(context, volume_id, instance_id, mountpoint):
+def volume_attached(context, volume_id, instance_id, host_name, mountpoint):
     """Ensure that a volume is set as attached."""
-    return IMPL.volume_attached(context, volume_id, instance_id, mountpoint)
+    return IMPL.volume_attached(context, volume_id, instance_id, host_name,
+                                mountpoint)
 
 
 def volume_create(context, values):
@@ -203,18 +182,20 @@ def volume_create(context, values):
     return IMPL.volume_create(context, values)
 
 
-def volume_data_get_for_host(context, host, session=None):
+def volume_data_get_for_host(context, host):
     """Get (volume_count, gigabytes) for project."""
     return IMPL.volume_data_get_for_host(context,
-                                         host,
-                                         session)
+                                         host)
 
 
-def volume_data_get_for_project(context, project_id, session=None):
+def volume_data_get_for_project(context, project_id):
     """Get (volume_count, gigabytes) for project."""
-    return IMPL.volume_data_get_for_project(context,
-                                            project_id,
-                                            session)
+    return IMPL.volume_data_get_for_project(context, project_id)
+
+
+def finish_volume_migration(context, src_vol_id, dest_vol_id):
+    """Perform database updates upon completion of volume migration."""
+    return IMPL.finish_volume_migration(context, src_vol_id, dest_vol_id)
 
 
 def volume_destroy(context, volume_id):
@@ -310,17 +291,18 @@ def snapshot_update(context, snapshot_id, values):
     return IMPL.snapshot_update(context, snapshot_id, values)
 
 
-def snapshot_data_get_for_project(context, project_id, session=None):
+def snapshot_data_get_for_project(context, project_id, volume_type_id=None):
     """Get count and gigabytes used for snapshots for specified project."""
     return IMPL.snapshot_data_get_for_project(context,
                                               project_id,
-                                              session)
+                                              volume_type_id)
 
 
 def snapshot_get_active_by_window(context, begin, end=None, project_id=None):
     """Get all the snapshots inside the window.
 
-    Specifying a project_id will filter for a certain project."""
+    Specifying a project_id will filter for a certain project.
+    """
     return IMPL.snapshot_get_active_by_window(context, begin, end, project_id)
 
 
@@ -363,6 +345,24 @@ def volume_metadata_update(context, volume_id, metadata, delete):
 ##################
 
 
+def volume_admin_metadata_get(context, volume_id):
+    """Get all administration metadata for a volume."""
+    return IMPL.volume_admin_metadata_get(context, volume_id)
+
+
+def volume_admin_metadata_delete(context, volume_id, key):
+    """Delete the given metadata item."""
+    IMPL.volume_admin_metadata_delete(context, volume_id, key)
+
+
+def volume_admin_metadata_update(context, volume_id, metadata, delete):
+    """Update metadata if it exists, otherwise create it."""
+    IMPL.volume_admin_metadata_update(context, volume_id, metadata, delete)
+
+
+##################
+
+
 def volume_type_create(context, values):
     """Create a new volume type."""
     return IMPL.volume_type_create(context, values)
@@ -373,14 +373,42 @@ def volume_type_get_all(context, inactive=False):
     return IMPL.volume_type_get_all(context, inactive)
 
 
-def volume_type_get(context, id):
+def volume_type_get(context, id, inactive=False):
     """Get volume type by id."""
-    return IMPL.volume_type_get(context, id)
+    return IMPL.volume_type_get(context, id, inactive)
 
 
 def volume_type_get_by_name(context, name):
     """Get volume type by name."""
     return IMPL.volume_type_get_by_name(context, name)
+
+
+def volume_type_qos_associations_get(context, qos_specs_id, inactive=False):
+    """Get volume types that are associated with specific qos specs."""
+    return IMPL.volume_type_qos_associations_get(context,
+                                                 qos_specs_id,
+                                                 inactive)
+
+
+def volume_type_qos_associate(context, type_id, qos_specs_id):
+    """Associate a volume type with specific qos specs."""
+    return IMPL.volume_type_qos_associate(context, type_id, qos_specs_id)
+
+
+def volume_type_qos_disassociate(context, qos_specs_id, type_id):
+    """Disassociate a volume type from specific qos specs."""
+    return IMPL.volume_type_qos_disassociate(context, qos_specs_id, type_id)
+
+
+def volume_type_qos_disassociate_all(context, qos_specs_id):
+    """Disassociate all volume types from specific qos specs."""
+    return IMPL.volume_type_qos_disassociate_all(context,
+                                                 qos_specs_id)
+
+
+def volume_type_qos_specs_get(context, type_id):
+    """Get all qos specs for given volume type."""
+    return IMPL.volume_type_qos_specs_get(context, type_id)
 
 
 def volume_type_destroy(context, id):
@@ -391,7 +419,8 @@ def volume_type_destroy(context, id):
 def volume_get_active_by_window(context, begin, end=None, project_id=None):
     """Get all the volumes inside the window.
 
-    Specifying a project_id will filter for a certain project."""
+    Specifying a project_id will filter for a certain project.
+    """
     return IMPL.volume_get_active_by_window(context, begin, end, project_id)
 
 
@@ -412,10 +441,96 @@ def volume_type_extra_specs_update_or_create(context,
                                              volume_type_id,
                                              extra_specs):
     """Create or update volume type extra specs. This adds or modifies the
-    key/value pairs specified in the extra specs dict argument"""
+    key/value pairs specified in the extra specs dict argument
+    """
     IMPL.volume_type_extra_specs_update_or_create(context,
                                                   volume_type_id,
                                                   extra_specs)
+
+
+###################
+
+
+def volume_type_encryption_get(context, volume_type_id, session=None):
+    return IMPL.volume_type_encryption_get(context, volume_type_id, session)
+
+
+def volume_type_encryption_delete(context, volume_type_id):
+    return IMPL.volume_type_encryption_delete(context, volume_type_id)
+
+
+# TODO(joel-coffman): split into two functions -- update and create
+def volume_type_encryption_update_or_create(context, volume_type_id,
+                                            encryption_specs):
+    return IMPL.volume_type_encryption_update_or_create(context,
+                                                        volume_type_id,
+                                                        encryption_specs)
+
+
+def volume_type_encryption_volume_get(context, volume_type_id, session=None):
+    return IMPL.volume_type_encryption_volume_get(context, volume_type_id,
+                                                  session)
+
+
+def volume_encryption_metadata_get(context, volume_id, session=None):
+    return IMPL.volume_encryption_metadata_get(context, volume_id, session)
+
+
+###################
+
+
+def qos_specs_create(context, values):
+    """Create a qos_specs."""
+    return IMPL.qos_specs_create(context, values)
+
+
+def qos_specs_get(context, qos_specs_id):
+    """Get all specification for a given qos_specs."""
+    return IMPL.qos_specs_get(context, qos_specs_id)
+
+
+def qos_specs_get_all(context, inactive=False, filters=None):
+    """Get all qos_specs."""
+    return IMPL.qos_specs_get_all(context, inactive, filters)
+
+
+def qos_specs_get_by_name(context, name):
+    """Get all specification for a given qos_specs."""
+    return IMPL.qos_specs_get_by_name(context, name)
+
+
+def qos_specs_associations_get(context, qos_specs_id):
+    """Get all associated volume types for a given qos_specs."""
+    return IMPL.qos_specs_associations_get(context, qos_specs_id)
+
+
+def qos_specs_associate(context, qos_specs_id, type_id):
+    """Associate qos_specs from volume type."""
+    return IMPL.qos_specs_associate(context, qos_specs_id, type_id)
+
+
+def qos_specs_disassociate(context, qos_specs_id, type_id):
+    """Disassociate qos_specs from volume type."""
+    return IMPL.qos_specs_disassociate(context, qos_specs_id, type_id)
+
+
+def qos_specs_disassociate_all(context, qos_specs_id):
+    """Disassociate qos_specs from all entities."""
+    return IMPL.qos_specs_disassociate_all(context, qos_specs_id)
+
+
+def qos_specs_delete(context, qos_specs_id):
+    """Delete the qos_specs."""
+    IMPL.qos_specs_delete(context, qos_specs_id)
+
+
+def qos_specs_update(context, qos_specs_id, specs):
+    """Update qos specs.
+
+    This adds or modifies the key/value pairs specified in the
+    specs dict argument for a given qos_specs.
+    """
+    IMPL.qos_specs_update(context, qos_specs_id, specs)
 
 
 ###################
@@ -482,93 +597,6 @@ def volume_glance_metadata_copy_from_volume_to_volume(context,
         src_volume_id,
         volume_id)
 
-###################
-
-
-def sm_backend_conf_create(context, values):
-    """Create a new SM Backend Config entry."""
-    return IMPL.sm_backend_conf_create(context, values)
-
-
-def sm_backend_conf_update(context, sm_backend_conf_id, values):
-    """Update a SM Backend Config entry."""
-    return IMPL.sm_backend_conf_update(context, sm_backend_conf_id, values)
-
-
-def sm_backend_conf_delete(context, sm_backend_conf_id):
-    """Delete a SM Backend Config."""
-    return IMPL.sm_backend_conf_delete(context, sm_backend_conf_id)
-
-
-def sm_backend_conf_get(context, sm_backend_conf_id):
-    """Get a specific SM Backend Config."""
-    return IMPL.sm_backend_conf_get(context, sm_backend_conf_id)
-
-
-def sm_backend_conf_get_by_sr(context, sr_uuid):
-    """Get a specific SM Backend Config."""
-    return IMPL.sm_backend_conf_get_by_sr(context, sr_uuid)
-
-
-def sm_backend_conf_get_all(context):
-    """Get all SM Backend Configs."""
-    return IMPL.sm_backend_conf_get_all(context)
-
-
-####################
-
-
-def sm_flavor_create(context, values):
-    """Create a new SM Flavor entry."""
-    return IMPL.sm_flavor_create(context, values)
-
-
-def sm_flavor_update(context, sm_flavor_id, values):
-    """Update a SM Flavor entry."""
-    return IMPL.sm_flavor_update(context, values)
-
-
-def sm_flavor_delete(context, sm_flavor_id):
-    """Delete a SM Flavor."""
-    return IMPL.sm_flavor_delete(context, sm_flavor_id)
-
-
-def sm_flavor_get(context, sm_flavor):
-    """Get a specific SM Flavor."""
-    return IMPL.sm_flavor_get(context, sm_flavor)
-
-
-def sm_flavor_get_all(context):
-    """Get all SM Flavors."""
-    return IMPL.sm_flavor_get_all(context)
-
-
-####################
-
-
-def sm_volume_create(context, values):
-    """Create a new child Zone entry."""
-    return IMPL.sm_volume_create(context, values)
-
-
-def sm_volume_update(context, volume_id, values):
-    """Update a child Zone entry."""
-    return IMPL.sm_volume_update(context, values)
-
-
-def sm_volume_delete(context, volume_id):
-    """Delete a child Zone."""
-    return IMPL.sm_volume_delete(context, volume_id)
-
-
-def sm_volume_get(context, volume_id):
-    """Get a specific child Zone."""
-    return IMPL.sm_volume_get(context, volume_id)
-
-
-def sm_volume_get_all(context):
-    """Get all child Zones."""
-    return IMPL.sm_volume_get_all(context)
 
 ###################
 
@@ -609,6 +637,11 @@ def quota_class_create(context, class_name, resource, limit):
 def quota_class_get(context, class_name, resource):
     """Retrieve a quota class or raise if it does not exist."""
     return IMPL.quota_class_get(context, class_name, resource)
+
+
+def quota_class_get_default(context):
+    """Retrieve all default quotas."""
+    return IMPL.quota_class_get_default(context)
 
 
 def quota_class_get_all_by_name(context, class_name):
@@ -748,3 +781,36 @@ def backup_update(context, backup_id, values):
 def backup_destroy(context, backup_id):
     """Destroy the backup or raise if it does not exist."""
     return IMPL.backup_destroy(context, backup_id)
+
+
+###################
+
+
+def transfer_get(context, transfer_id):
+    """Get a volume transfer record or raise if it does not exist."""
+    return IMPL.transfer_get(context, transfer_id)
+
+
+def transfer_get_all(context):
+    """Get all volume transfer records."""
+    return IMPL.transfer_get_all(context)
+
+
+def transfer_get_all_by_project(context, project_id):
+    """Get all volume transfer records for specified project."""
+    return IMPL.transfer_get_all_by_project(context, project_id)
+
+
+def transfer_create(context, values):
+    """Create an entry in the transfers table."""
+    return IMPL.transfer_create(context, values)
+
+
+def transfer_destroy(context, transfer_id):
+    """Destroy a record in the volume transfer table."""
+    return IMPL.transfer_destroy(context, transfer_id)
+
+
+def transfer_accept(context, transfer_id, user_id, project_id):
+    """Accept a volume transfer."""
+    return IMPL.transfer_accept(context, transfer_id, user_id, project_id)

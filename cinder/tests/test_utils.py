@@ -14,27 +14,31 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+
 import __builtin__
 import datetime
 import hashlib
 import os
-import os.path
-import paramiko
+import socket
 import StringIO
 import tempfile
 import uuid
 
 import mox
+from oslo.config import cfg
+import paramiko
 
 import cinder
+from cinder.brick.initiator import connector
+from cinder.brick.initiator import linuxfc
 from cinder import exception
-from cinder import flags
+from cinder.openstack.common import processutils as putils
 from cinder.openstack.common import timeutils
 from cinder import test
 from cinder import utils
 
 
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
 
 
 class ExecuteTestCase(test.TestCase):
@@ -64,8 +68,8 @@ echo $runs > "$1"
 exit 1
 ''')
             fp.close()
-            os.chmod(tmpfilename, 0755)
-            self.assertRaises(exception.ProcessExecutionError,
+            os.chmod(tmpfilename, 0o755)
+            self.assertRaises(putils.ProcessExecutionError,
                               utils.execute,
                               tmpfilename, tmpfilename2, attempts=10,
                               process_input='foo',
@@ -84,14 +88,14 @@ exit 1
             os.unlink(tmpfilename2)
 
     def test_unknown_kwargs_raises_error(self):
-        self.assertRaises(exception.Error,
+        self.assertRaises(putils.UnknownArgumentError,
                           utils.execute,
                           '/usr/bin/env', 'true',
                           this_is_not_a_valid_kwarg=True)
 
     def test_check_exit_code_boolean(self):
         utils.execute('/usr/bin/env', 'false', check_exit_code=False)
-        self.assertRaises(exception.ProcessExecutionError,
+        self.assertRaises(putils.ProcessExecutionError,
                           utils.execute,
                           '/usr/bin/env', 'false', check_exit_code=True)
 
@@ -109,7 +113,7 @@ echo foo > "$1"
 grep foo
 ''')
             fp.close()
-            os.chmod(tmpfilename, 0755)
+            os.chmod(tmpfilename, 0o755)
             utils.execute(tmpfilename,
                           tmpfilename2,
                           process_input='foo',
@@ -299,22 +303,10 @@ class GenericUtilsTestCase(test.TestCase):
         hostname = "<}\x1fh\x10e\x08l\x02l\x05o\x12!{>"
         self.assertEqual("hello", utils.sanitize_hostname(hostname))
 
-    def test_bool_from_str(self):
-        self.assertTrue(utils.bool_from_str('1'))
-        self.assertTrue(utils.bool_from_str('2'))
-        self.assertTrue(utils.bool_from_str('-1'))
-        self.assertTrue(utils.bool_from_str('true'))
-        self.assertTrue(utils.bool_from_str('True'))
-        self.assertTrue(utils.bool_from_str('tRuE'))
-        self.assertFalse(utils.bool_from_str('False'))
-        self.assertFalse(utils.bool_from_str('false'))
-        self.assertFalse(utils.bool_from_str('0'))
-        self.assertFalse(utils.bool_from_str(None))
-        self.assertFalse(utils.bool_from_str('junk'))
-
     def test_generate_glance_url(self):
         generated_url = utils.generate_glance_url()
-        actual_url = "http://%s:%d" % (FLAGS.glance_host, FLAGS.glance_port)
+        actual_url = "http://%s:%d" % (CONF.glance_host,
+                                       CONF.glance_port)
         self.assertEqual(generated_url, actual_url)
 
     def test_read_cached_file(self):
@@ -367,7 +359,7 @@ class GenericUtilsTestCase(test.TestCase):
     def test_read_file_as_root(self):
         def fake_execute(*args, **kwargs):
             if args[1] == 'bad':
-                raise exception.ProcessExecutionError
+                raise putils.ProcessExecutionError
             return 'fakecontents', None
 
         self.stubs.Set(utils, 'execute', fake_execute)
@@ -375,11 +367,6 @@ class GenericUtilsTestCase(test.TestCase):
         self.assertEqual(contents, 'fakecontents')
         self.assertRaises(exception.FileNotFound,
                           utils.read_file_as_root, 'bad')
-
-    def test_strcmp_const_time(self):
-        self.assertTrue(utils.strcmp_const_time('abc123', 'abc123'))
-        self.assertFalse(utils.strcmp_const_time('a', 'aaaaa'))
-        self.assertFalse(utils.strcmp_const_time('ABC123', 'abc123'))
 
     def test_temporary_chown(self):
         def fake_execute(*args, **kwargs):
@@ -428,13 +415,8 @@ class GenericUtilsTestCase(test.TestCase):
 
     def test_safe_parse_xml(self):
 
-        normal_body = ("""
-                 <?xml version="1.0" ?><foo>
-                    <bar>
-                        <v1>hey</v1>
-                        <v2>there</v2>
-                    </bar>
-                </foo>""").strip()
+        normal_body = ('<?xml version="1.0" ?>'
+                       '<foo><bar><v1>hey</v1><v2>there</v2></bar></foo>')
 
         def killer_body():
             return (("""<!DOCTYPE x [
@@ -453,7 +435,9 @@ class GenericUtilsTestCase(test.TestCase):
             }).strip()
 
         dom = utils.safe_minidom_parse_string(normal_body)
-        self.assertEqual(normal_body, str(dom.toxml()))
+        # Some versions of minidom inject extra newlines so we ignore them
+        result = str(dom.toxml()).replace('\n', '')
+        self.assertEqual(normal_body, result)
 
         self.assertRaises(ValueError,
                           utils.safe_minidom_parse_string,
@@ -741,3 +725,60 @@ class SSHPoolTestCase(test.TestCase):
             third_id = ssh.id
 
         self.assertNotEqual(first_id, third_id)
+
+
+class BrickUtils(test.TestCase):
+    """Unit test to test the brick utility
+    wrapper functions.
+    """
+
+    def test_brick_get_connector_properties(self):
+
+        self.mox.StubOutWithMock(socket, 'gethostname')
+        socket.gethostname().AndReturn('fakehost')
+
+        self.mox.StubOutWithMock(connector.ISCSIConnector, 'get_initiator')
+        connector.ISCSIConnector.get_initiator().AndReturn('fakeinitiator')
+
+        self.mox.StubOutWithMock(linuxfc.LinuxFibreChannel, 'get_fc_wwpns')
+        linuxfc.LinuxFibreChannel.get_fc_wwpns().AndReturn(None)
+
+        self.mox.StubOutWithMock(linuxfc.LinuxFibreChannel, 'get_fc_wwnns')
+        linuxfc.LinuxFibreChannel.get_fc_wwnns().AndReturn(None)
+
+        props = {'initiator': 'fakeinitiator',
+                 'host': 'fakehost',
+                 'ip': CONF.my_ip,
+                 }
+
+        self.mox.ReplayAll()
+        props_actual = utils.brick_get_connector_properties()
+        self.assertEqual(props, props_actual)
+        self.mox.VerifyAll()
+
+    def test_brick_get_connector(self):
+
+        root_helper = utils.get_root_helper()
+
+        self.mox.StubOutClassWithMocks(connector, 'ISCSIConnector')
+        connector.ISCSIConnector(execute=putils.execute,
+                                 driver=None,
+                                 root_helper=root_helper,
+                                 use_multipath=False)
+
+        self.mox.StubOutClassWithMocks(connector, 'FibreChannelConnector')
+        connector.FibreChannelConnector(execute=putils.execute,
+                                        driver=None,
+                                        root_helper=root_helper,
+                                        use_multipath=False)
+
+        self.mox.StubOutClassWithMocks(connector, 'AoEConnector')
+        connector.AoEConnector(execute=putils.execute,
+                               driver=None,
+                               root_helper=root_helper)
+
+        self.mox.ReplayAll()
+        utils.brick_get_connector('iscsi')
+        utils.brick_get_connector('fibre_channel')
+        utils.brick_get_connector('aoe')
+        self.mox.VerifyAll()

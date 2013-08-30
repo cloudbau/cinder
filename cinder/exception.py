@@ -24,11 +24,14 @@ SHOULD include dedicated exception logging.
 
 """
 
+import sys
+
 from oslo.config import cfg
 import webob.exc
 
-from cinder import flags
 from cinder.openstack.common import log as logging
+from cinder.openstack.common import processutils
+
 
 LOG = logging.getLogger(__name__)
 
@@ -38,8 +41,8 @@ exc_log_opts = [
                 help='make exception message format errors fatal'),
 ]
 
-FLAGS = flags.FLAGS
-FLAGS.register_opts(exc_log_opts)
+CONF = cfg.CONF
+CONF.register_opts(exc_log_opts)
 
 
 class ConvertedException(webob.exc.WSGIHTTPException):
@@ -50,47 +53,8 @@ class ConvertedException(webob.exc.WSGIHTTPException):
         super(ConvertedException, self).__init__()
 
 
-class ProcessExecutionError(IOError):
-    def __init__(self, stdout=None, stderr=None, exit_code=None, cmd=None,
-                 description=None):
-        self.exit_code = exit_code
-        self.stderr = stderr
-        self.stdout = stdout
-        self.cmd = cmd
-        self.description = description
-
-        if description is None:
-            description = _('Unexpected error while running command.')
-        if exit_code is None:
-            exit_code = '-'
-        message = _('%(description)s\nCommand: %(cmd)s\n'
-                    'Exit code: %(exit_code)s\nStdout: %(stdout)r\n'
-                    'Stderr: %(stderr)r') % locals()
-        IOError.__init__(self, message)
-
-
 class Error(Exception):
     pass
-
-
-class DBError(Error):
-    """Wraps an implementation specific exception."""
-    def __init__(self, inner_exception=None):
-        self.inner_exception = inner_exception
-        super(DBError, self).__init__(str(inner_exception))
-
-
-def wrap_db_error(f):
-    def _wrap(*args, **kwargs):
-        try:
-            return f(*args, **kwargs)
-        except UnicodeEncodeError:
-            raise InvalidUnicodeParameter()
-        except Exception, e:
-            LOG.exception(_('DB exception wrapped.'))
-            raise DBError(e)
-    _wrap.func_name = f.func_name
-    return _wrap
 
 
 class CinderException(Exception):
@@ -119,19 +83,26 @@ class CinderException(Exception):
             try:
                 message = self.message % kwargs
 
-            except Exception as e:
+            except Exception:
+                exc_info = sys.exc_info()
                 # kwargs doesn't match a variable in the message
                 # log the issue and the kwargs
                 LOG.exception(_('Exception in string format operation'))
                 for name, value in kwargs.iteritems():
                     LOG.error("%s: %s" % (name, value))
-                if FLAGS.fatal_exception_format_errors:
-                    raise e
-                else:
-                    # at least get the core message out if something happened
-                    message = self.message
+                if CONF.fatal_exception_format_errors:
+                    raise exc_info[0], exc_info[1], exc_info[2]
+                # at least get the core message out if something happened
+                message = self.message
 
+        # NOTE(luisg): We put the actual message in 'msg' so that we can access
+        # it, because if we try to access the message via 'message' it will be
+        # overshadowed by the class' message attribute
+        self.msg = message
         super(CinderException, self).__init__(message)
+
+    def __unicode__(self):
+        return unicode(self.msg)
 
 
 class GlanceConnectionFailed(CinderException):
@@ -162,6 +133,15 @@ class Invalid(CinderException):
 
 class InvalidSnapshot(Invalid):
     message = _("Invalid snapshot") + ": %(reason)s"
+
+
+class InvalidSourceVolume(Invalid):
+    message = _("Invalid source volume %(reason)s.")
+
+
+class InvalidVolumeAttachMode(Invalid):
+    message = _("Invalid attaching mode '%(mode)s' for "
+                "volume %(volume_id)s.")
 
 
 class VolumeAttached(Invalid):
@@ -196,15 +176,18 @@ class InvalidContentType(Invalid):
     message = _("Invalid content type %(content_type)s.")
 
 
-class InvalidUnicodeParameter(Invalid):
-    message = _("Invalid Parameter: "
-                "Unicode is not supported by the current database.")
+class InvalidHost(Invalid):
+    message = _("Invalid host") + ": %(reason)s"
 
 
 # Cannot be templated as the error syntax varies.
 # msg needs to be constructed when raised.
 class InvalidParameterValue(Invalid):
     message = _("%(err)s")
+
+
+class InvalidAuthKey(Invalid):
+    message = _("Invalid auth key") + ": %(reason)s"
 
 
 class ServiceUnavailable(Invalid):
@@ -215,8 +198,12 @@ class ImageUnacceptable(Invalid):
     message = _("Image %(image_id)s is unacceptable: %(reason)s")
 
 
+class DeviceUnavailable(Invalid):
+    message = _("The device in the path %(path)s is unavailable: %(reason)s")
+
+
 class InvalidUUID(Invalid):
-    message = _("Expected a uuid but received %(uuid).")
+    message = _("Expected a uuid but received %(uuid)s.")
 
 
 class NotFound(CinderException):
@@ -244,6 +231,11 @@ class VolumeNotFoundForInstance(VolumeNotFound):
 
 class VolumeMetadataNotFound(NotFound):
     message = _("Volume %(volume_id)s has no metadata with "
+                "key %(metadata_key)s.")
+
+
+class VolumeAdminMetadataNotFound(NotFound):
+    message = _("Volume %(volume_id)s has no administration metadata with "
                 "key %(metadata_key)s.")
 
 
@@ -297,18 +289,6 @@ class SnapshotIsBusy(CinderException):
 
 class ISCSITargetNotFoundForVolume(NotFound):
     message = _("No target id found for volume %(volume_id)s.")
-
-
-class ISCSITargetCreateFailed(CinderException):
-    message = _("Failed to create iscsi target for volume %(volume_id)s.")
-
-
-class ISCSITargetAttachFailed(CinderException):
-    message = _("Failed to attach iSCSI target for volume %(volume_id)s.")
-
-
-class ISCSITargetRemoveFailed(CinderException):
-    message = _("Failed to remove iscsi target for volume %(volume_id)s.")
 
 
 class DiskNotFound(NotFound):
@@ -414,6 +394,10 @@ class VolumeTypeExists(Duplicate):
     message = _("Volume Type %(id)s already exists.")
 
 
+class VolumeTypeEncryptionExists(Invalid):
+    message = _("Volume type encryption for type %(type_id)s already exists.")
+
+
 class MigrationError(CinderException):
     message = _("Migration error") + ": %(reason)s"
 
@@ -424,6 +408,10 @@ class MalformedRequestBody(CinderException):
 
 class ConfigNotFound(NotFound):
     message = _("Could not find config at %(path)s")
+
+
+class ParameterNotFound(NotFound):
+    message = _("Could not find parameter %(param)s")
 
 
 class PasteAppNotFound(NotFound):
@@ -561,8 +549,44 @@ class GlanceMetadataExists(Invalid):
                 " exists for volume id %(volume_id)s")
 
 
+class GlanceMetadataNotFound(NotFound):
+    message = _("Glance metadata for volume/snapshot %(id)s cannot be found.")
+
+
+class ExportFailure(Invalid):
+    message = _("Failed to export for volume: %(reason)s")
+
+
+class MetadataCreateFailure(Invalid):
+    message = _("Failed to create metadata for volume: %(reason)s")
+
+
+class MetadataUpdateFailure(Invalid):
+    message = _("Failed to update metadata for volume: %(reason)s")
+
+
+class MetadataCopyFailure(Invalid):
+    message = _("Failed to copy metadata to volume: %(reason)s")
+
+
 class ImageCopyFailure(Invalid):
-    message = _("Failed to copy image to volume")
+    message = _("Failed to copy image to volume: %(reason)s")
+
+
+class BackupInvalidCephArgs(Invalid):
+    message = _("Invalid Ceph args provided for backup rbd operation")
+
+
+class BackupOperationError(Invalid):
+    message = _("An error has occurred during backup operation")
+
+
+class BackupRBDOperationFailed(Invalid):
+    message = _("Backup RBD operation failed")
+
+
+class BackupVolumeInvalidType(Invalid):
+    message = _("Backup volume %(volume_id)s type not recognised.")
 
 
 class BackupNotFound(NotFound):
@@ -577,13 +601,86 @@ class SwiftConnectionFailed(CinderException):
     message = _("Connection to swift failed") + ": %(reason)s"
 
 
-class XtreemfsException(CinderException):
-    message = _("Xtreemfs miss-configuration")
+class TransferNotFound(NotFound):
+    message = _("Transfer %(transfer_id)s could not be found.")
 
 
-class XtreemfsNoSharesMounted(NotFound):
-    message = _("No mounted Xtreemfs shares was found")
+class VolumeMigrationFailed(CinderException):
+    message = _("Volume migration failed") + ": %(reason)s"
 
 
-class XtreemfsNoSuitableShareFound(NotFound):
-    message = _("No suitable share was found to host %(volume_size)dG")
+class ProtocolNotSupported(CinderException):
+    message = _("Connect to volume via protocol %(protocol)s not supported.")
+
+
+class SSHInjectionThreat(CinderException):
+    message = _("SSH command injection detected") + ": %(command)s"
+
+
+class CoraidException(CinderException):
+    message = _('Coraid Cinder Driver exception.')
+
+
+class CoraidJsonEncodeFailure(CoraidException):
+    message = _('Failed to encode json data.')
+
+
+class CoraidESMBadCredentials(CoraidException):
+    message = _('Login on ESM failed.')
+
+
+class CoraidESMReloginFailed(CoraidException):
+    message = _('Relogin on ESM failed.')
+
+
+class CoraidESMBadGroup(CoraidException):
+    message = _('Group with name "%(group_name)s" not found.')
+
+
+class CoraidESMConfigureError(CoraidException):
+    message = _('ESM configure request failed: %(message)s.')
+
+
+class CoraidESMNotAvailable(CoraidException):
+    message = _('Coraid ESM not available with reason: %(reason)s.')
+
+
+class QoSSpecsExists(Duplicate):
+    message = _("QoS Specs %(specs_id)s already exists.")
+
+
+class QoSSpecsCreateFailed(CinderException):
+    message = _("Failed to create qos_specs: "
+                "%(name)s with specs %(qos_specs)s.")
+
+
+class QoSSpecsUpdateFailed(CinderException):
+    message = _("Failed to update qos_specs: "
+                "%(specs_id)s with specs %(qos_specs)s.")
+
+
+class QoSSpecsNotFound(NotFound):
+    message = _("No such QoS spec %(specs_id)s.")
+
+
+class QoSSpecsAssociateFailed(CinderException):
+    message = _("Failed to associate qos_specs: "
+                "%(specs_id)s with type %(type_id)s.")
+
+
+class QoSSpecsDisassociateFailed(CinderException):
+    message = _("Failed to disassociate qos_specs: "
+                "%(specs_id)s with type %(type_id)s.")
+
+
+class QoSSpecsKeyNotFound(NotFound):
+    message = _("QoS spec %(specs_id)s has no spec with "
+                "key %(specs_key)s.")
+
+
+class InvalidQoSSpecs(Invalid):
+    message = _("Invalid qos specs") + ": %(reason)s"
+
+
+class QoSSpecsInUse(CinderException):
+    message = _("QoS Specs %(specs_id)s is still associated with entities.")
