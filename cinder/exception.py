@@ -605,7 +605,6 @@ class TransferNotFound(NotFound):
     message = _("Transfer %(transfer_id)s could not be found.")
 
 
-<<<<<<< HEAD
 class VolumeMigrationFailed(CinderException):
     message = _("Volume migration failed") + ": %(reason)s"
 
