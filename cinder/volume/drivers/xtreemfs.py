@@ -273,7 +273,7 @@ class XtreemfsDriver(nfs.RemoteFsDriver):
             self._execute('mkdir', '-p', mount_path)
 
         try:
-            self._execute('mount.xtreemfs', xtreemfs_share,
+            self._execute('mount.xtreemfs', '-o', 'allow_other', xtreemfs_share,
                           mount_path, run_as_root=True)
         except exception.ProcessExecutionError as exc:
             if ensure and 'already mounted' in exc.stderr:
