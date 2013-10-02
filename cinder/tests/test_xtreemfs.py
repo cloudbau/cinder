@@ -329,7 +329,8 @@ class XtreemFsDriverTestCase(test.TestCase):
         # Mock running xtreemfs mount command to do nothing.
         self._mocker.StubOutWithMock(self._driver, "_execute")
         self._driver._execute(
-            "mount.xtreemfs", share, self.mount_point, run_as_root=True
+            "mount.xtreemfs", '-o', 'allow_other', share, self.mount_point,
+            run_as_root=True
         )
 
         self._mocker.ReplayAll()
@@ -345,7 +346,8 @@ class XtreemFsDriverTestCase(test.TestCase):
         # Mock running xtreemfs mount command to raise an error.
         self._mocker.StubOutWithMock(self._driver, "_execute")
         self._driver._execute(
-            "mount.xtreemfs", share, self.mount_point, run_as_root=True
+            "mount.xtreemfs", '-o', 'allow_other', share, self.mount_point,
+            run_as_root=True
         ).AndRaise(exception.ProcessExecutionError(stderr="already mounted"))
 
         self._mocker.ReplayAll()
@@ -361,7 +363,8 @@ class XtreemFsDriverTestCase(test.TestCase):
         # Mock running xtreemfs mount command to raise an error.
         self._mocker.StubOutWithMock(self._driver, "_execute")
         self._driver._execute(
-            "mount.xtreemfs", share, self.mount_point, run_as_root=True
+            "mount.xtreemfs", '-o', 'allow_other', share, self.mount_point,
+            run_as_root=True
         ).AndRaise(exception.ProcessExecutionError(stderr="already mounted"))
 
         self._mocker.ReplayAll()
@@ -382,7 +385,8 @@ class XtreemFsDriverTestCase(test.TestCase):
         self._driver._execute("mkdir", "-p", self.mount_point)
         # Mock running xtreemfs mount.
         self._driver._execute(
-            "mount.xtreemfs", share, self.mount_point, run_as_root=True
+            "mount.xtreemfs", '-o', 'allow_other', share, self.mount_point,
+            run_as_root=True
         )
 
         self._mocker.ReplayAll()
