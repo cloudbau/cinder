@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-#   Copyright 2012 OpenStack LLC.
+#   Copyright 2012 OpenStack Foundation
 #
 #   Licensed under the Apache License, Version 2.0 (the "License"); you may
 #   not use this file except in compliance with the License. You may obtain
@@ -85,7 +85,7 @@ class VolumeTenantAttributeTest(test.TestCase):
         req.environ['cinder.context'] = ctx
         res = req.get_response(app())
         vol = json.loads(res.body)['volume']
-        self.assertFalse('os-vol-tenant-attr:tenant_id' in vol)
+        self.assertNotIn('os-vol-tenant-attr:tenant_id', vol)
 
     def test_list_detail_volumes_allowed(self):
         ctx = context.RequestContext('admin', 'fake', True)
@@ -103,7 +103,7 @@ class VolumeTenantAttributeTest(test.TestCase):
         req.environ['cinder.context'] = ctx
         res = req.get_response(app())
         vol = json.loads(res.body)['volumes']
-        self.assertFalse('os-vol-tenant-attr:tenant_id' in vol[0])
+        self.assertNotIn('os-vol-tenant-attr:tenant_id', vol[0])
 
     def test_list_simple_volumes_no_tenant_id(self):
         ctx = context.RequestContext('admin', 'fake', True)
@@ -112,7 +112,7 @@ class VolumeTenantAttributeTest(test.TestCase):
         req.environ['cinder.context'] = ctx
         res = req.get_response(app())
         vol = json.loads(res.body)['volumes']
-        self.assertFalse('os-vol-tenant-attr:tenant_id' in vol[0])
+        self.assertNotIn('os-vol-tenant-attr:tenant_id', vol[0])
 
     def test_get_volume_xml(self):
         ctx = context.RequestContext('admin', 'fake', True)

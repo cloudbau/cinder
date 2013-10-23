@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2011 OpenStack, LLC.
+# Copyright (c) 2011 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -21,6 +21,7 @@
 from oslo.config import cfg
 
 from cinder import exception
+from cinder.openstack.common.gettextutils import _
 from cinder.openstack.common import policy
 from cinder import utils
 

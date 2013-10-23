@@ -26,6 +26,7 @@ from cinder.image import image_utils
 from cinder.openstack.common import log as logging
 from cinder.openstack.common import processutils as putils
 from cinder import units
+from cinder import utils
 from cinder.volume import driver
 
 VERSION = '1.1.0'
@@ -50,7 +51,14 @@ volume_opts = [
                  default=1.0,
                  help=('This will compare the allocated to available space on '
                        'the volume destination.  If the ratio exceeds this '
-                       'number, the destination will no longer be valid.'))
+                       'number, the destination will no longer be valid.')),
+    cfg.StrOpt('nfs_mount_point_base',
+               default='$state_path/mnt',
+               help=('Base dir containing mount points for nfs shares.')),
+    cfg.StrOpt('nfs_mount_options',
+               default=None,
+               help=('Mount options passed to the nfs client. See section '
+                     'of the nfs man page for details.')),
 ]
 
 
@@ -62,6 +70,11 @@ class RemoteFsDriver(driver.VolumeDriver):
     """Common base for drivers that work like NFS."""
 
     VERSION = "0.0.0"
+
+    def __init__(self, *args, **kwargs):
+        super(RemoteFsDriver, self).__init__(*args, **kwargs)
+        self.shares = {}
+        self._mounted_shares = []
 
     def check_for_setup_error(self):
         """Just to override parent behavior."""
@@ -359,7 +372,17 @@ class NfsDriver(RemoteFsDriver):
         self._remotefsclient = None
         super(NfsDriver, self).__init__(*args, **kwargs)
         self.configuration.append_config_values(volume_opts)
-        self._remotefsclient = remotefs.RemoteFsClient('nfs', execute)
+        root_helper = utils.get_root_helper()
+        base = getattr(self.configuration,
+                       'nfs_mount_point_base',
+                       CONF.nfs_mount_point_base)
+        opts = getattr(self.configuration,
+                       'nfs_mount_options',
+                       CONF.nfs_mount_options)
+        self._remotefsclient = remotefs.RemoteFsClient(
+            'nfs', root_helper, execute=execute,
+            nfs_mount_point_base=base,
+            nfs_mount_options=opts)
 
     def set_execute(self, execute):
         super(NfsDriver, self).set_execute(execute)
@@ -397,13 +420,14 @@ class NfsDriver(RemoteFsDriver):
 
         self.shares = {}  # address : options
 
+        # Check if mount.nfs is installed
         try:
-            self._execute('mount.nfs', check_exit_code=False)
+            self._execute('mount.nfs', check_exit_code=False, run_as_root=True)
         except OSError as exc:
             if exc.errno == errno.ENOENT:
                 raise exception.NfsException('mount.nfs is not installed')
             else:
-                raise
+                raise exc
 
     def _ensure_share_mounted(self, nfs_share):
         mnt_flags = []
@@ -413,14 +437,6 @@ class NfsDriver(RemoteFsDriver):
 
     def _find_share(self, volume_size_in_gib):
         """Choose NFS share among available ones for given volume size.
-
-        First validation step: ratio of actual space (used_space / total_space)
-        is less than 'nfs_used_ratio'.
-
-        Second validation step: apparent space allocated (differs from actual
-        space used when using sparse files) and compares the apparent available
-        space (total_available * nfs_oversub_ratio) to ensure enough space is
-        available for the new volume.
 
         For instances with more than one share that meets the criteria, the
         share with the least "allocated" space will be selected.
@@ -434,33 +450,11 @@ class NfsDriver(RemoteFsDriver):
         target_share = None
         target_share_reserved = 0
 
-        used_ratio = self.configuration.nfs_used_ratio
-        oversub_ratio = self.configuration.nfs_oversub_ratio
-
-        requested_volume_size = volume_size_in_gib * units.GiB
-
         for nfs_share in self._mounted_shares:
+            if not self._is_share_eligible(nfs_share, volume_size_in_gib):
+                continue
             total_size, total_available, total_allocated = \
                 self._get_capacity_info(nfs_share)
-            apparent_size = max(0, total_size * oversub_ratio)
-            apparent_available = max(0, apparent_size - total_allocated)
-            used = (total_size - total_available) / total_size
-            if used > used_ratio:
-                # NOTE(morganfainberg): We check the used_ratio first since
-                # with oversubscription it is possible to not have the actual
-                # available space but be within our oversubscription limit
-                # therefore allowing this share to still be selected as a valid
-                # target.
-                LOG.debug(_('%s is above nfs_used_ratio'), nfs_share)
-                continue
-            if apparent_available <= requested_volume_size:
-                LOG.debug(_('%s is above nfs_oversub_ratio'), nfs_share)
-                continue
-            if total_allocated / total_size >= oversub_ratio:
-                LOG.debug(_('%s reserved space is above nfs_oversub_ratio'),
-                          nfs_share)
-                continue
-
             if target_share is not None:
                 if target_share_reserved > total_allocated:
                     target_share = nfs_share
@@ -477,14 +471,56 @@ class NfsDriver(RemoteFsDriver):
 
         return target_share
 
+    def _is_share_eligible(self, nfs_share, volume_size_in_gib):
+        """Verifies NFS share is eligible to host volume with given size.
+
+        First validation step: ratio of actual space (used_space / total_space)
+        is less than 'nfs_used_ratio'. Second validation step: apparent space
+        allocated (differs from actual space used when using sparse files)
+        and compares the apparent available
+        space (total_available * nfs_oversub_ratio) to ensure enough space is
+        available for the new volume.
+
+        :param nfs_share: nfs share
+        :param volume_size_in_gib: int size in GB
+        """
+
+        used_ratio = self.configuration.nfs_used_ratio
+        oversub_ratio = self.configuration.nfs_oversub_ratio
+        requested_volume_size = volume_size_in_gib * units.GiB
+
+        total_size, total_available, total_allocated = \
+            self._get_capacity_info(nfs_share)
+        apparent_size = max(0, total_size * oversub_ratio)
+        apparent_available = max(0, apparent_size - total_allocated)
+        used = (total_size - total_available) / total_size
+        if used > used_ratio:
+            # NOTE(morganfainberg): We check the used_ratio first since
+            # with oversubscription it is possible to not have the actual
+            # available space but be within our oversubscription limit
+            # therefore allowing this share to still be selected as a valid
+            # target.
+            LOG.debug(_('%s is above nfs_used_ratio'), nfs_share)
+            return False
+        if apparent_available <= requested_volume_size:
+            LOG.debug(_('%s is above nfs_oversub_ratio'), nfs_share)
+            return False
+        if total_allocated / total_size >= oversub_ratio:
+            LOG.debug(_('%s reserved space is above nfs_oversub_ratio'),
+                      nfs_share)
+            return False
+        return True
+
     def _get_mount_point_for_share(self, nfs_share):
         """Needed by parent class."""
         return self._remotefsclient.get_mount_point(nfs_share)
 
     def _get_capacity_info(self, nfs_share):
         """Calculate available space on the NFS share.
+
         :param nfs_share: example 172.18.194.100:/var/nfs
         """
+
         mount_point = self._get_mount_point_for_share(nfs_share)
 
         df, _ = self._execute('stat', '-f', '-c', '%S %b %a', mount_point,

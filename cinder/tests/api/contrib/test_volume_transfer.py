@@ -100,7 +100,7 @@ class VolumeTransferAPITestCase(test.TestCase):
         dom = minidom.parseString(res.body)
         transfer_xml = dom.getElementsByTagName('transfer')
         name = transfer_xml.item(0).getAttribute('name')
-        self.assertEquals(name.strip(), "test_transfer")
+        self.assertEqual(name.strip(), "test_transfer")
 
         db.transfer_destroy(context.get_admin_context(), transfer['id'])
         db.volume_destroy(context.get_admin_context(), volume_id)
@@ -251,11 +251,11 @@ class VolumeTransferAPITestCase(test.TestCase):
         LOG.info(res_dict)
 
         self.assertEqual(res.status_int, 202)
-        self.assertTrue('id' in res_dict['transfer'])
-        self.assertTrue('auth_key' in res_dict['transfer'])
-        self.assertTrue('created_at' in res_dict['transfer'])
-        self.assertTrue('name' in res_dict['transfer'])
-        self.assertTrue('volume_id' in res_dict['transfer'])
+        self.assertIn('id', res_dict['transfer'])
+        self.assertIn('auth_key', res_dict['transfer'])
+        self.assertIn('created_at', res_dict['transfer'])
+        self.assertIn('name', res_dict['transfer'])
+        self.assertIn('volume_id', res_dict['transfer'])
 
         db.volume_destroy(context.get_admin_context(), volume_id)
 
@@ -513,7 +513,9 @@ class VolumeTransferAPITestCase(test.TestCase):
 
         def fake_transfer_api_accept_throwing_VolumeSizeExceedsAvailableQuota(
                 cls, context, transfer, volume_id):
-            raise exception.VolumeSizeExceedsAvailableQuota()
+            raise exception.VolumeSizeExceedsAvailableQuota(requested='2',
+                                                            consumed='2',
+                                                            quota='3')
 
         self.stubs.Set(
             cinder.transfer.API,
@@ -538,7 +540,8 @@ class VolumeTransferAPITestCase(test.TestCase):
         self.assertEqual(res_dict['overLimit']['code'], 413)
         self.assertEqual(res_dict['overLimit']['message'],
                          'Requested volume or snapshot exceeds allowed '
-                         'Gigabytes quota')
+                         'Gigabytes quota. Requested 2G, quota is 3G and '
+                         '2G has been consumed.')
 
     def test_accept_transfer_with_VolumeLimitExceeded(self):
 

@@ -236,7 +236,7 @@ class API(base.Base):
         # because the volume cannot be decrypted without its key.
         encryption_key_id = volume.get('encryption_key_id', None)
         if encryption_key_id is not None:
-            self.key_manager.delete_key(encryption_key_id)
+            self.key_manager.delete_key(context, encryption_key_id)
 
         now = timeutils.utcnow()
         self.db.volume_update(context, volume_id, {'status': 'deleting',
@@ -496,7 +496,10 @@ class API(base.Base):
                                     's_size': volume['size'],
                                     'd_consumed': _consumed(over),
                                     'd_quota': quotas[over]})
-                    raise exception.VolumeSizeExceedsAvailableQuota()
+                    raise exception.VolumeSizeExceedsAvailableQuota(
+                        requested=volume['size'],
+                        consumed=_consumed('gigabytes'),
+                        quota=quotas['gigabytes'])
                 elif 'snapshots' in over:
                     msg = _("Quota exceeded for %(s_pid)s, tried to create "
                             "snapshot (%(d_consumed)d snapshots "

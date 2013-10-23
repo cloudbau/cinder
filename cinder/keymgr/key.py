@@ -55,9 +55,7 @@ class Key(object):
 
 
 class SymmetricKey(Key):
-    """
-    This class represents symmetric keys
-    """
+    """This class represents symmetric keys."""
 
     def __init__(self, alg, key):
         """Create a new SymmetricKey object.
@@ -79,3 +77,15 @@ class SymmetricKey(Key):
     def get_encoded(self):
         """Returns the key in its encoded format."""
         return self.key
+
+    def __eq__(self, other):
+        if isinstance(other, SymmetricKey):
+            return (self.alg == other.alg and
+                    self.key == other.key)
+        return NotImplemented
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result

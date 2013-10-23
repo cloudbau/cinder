@@ -22,171 +22,43 @@ Helper methods to deal with images.
 
 This is essentially a copy from nova.virt.images.py
 Some slight modifications, but at some point
-we should look at maybe pushign this up to OSLO
+we should look at maybe pushing this up to Oslo
 """
 
 
 import contextlib
 import os
-import re
 import tempfile
 
 from oslo.config import cfg
 
 from cinder import exception
 from cinder.openstack.common import fileutils
+from cinder.openstack.common import imageutils
 from cinder.openstack.common import log as logging
+from cinder.openstack.common import processutils
 from cinder.openstack.common import strutils
 from cinder import utils
-
+from cinder.volume import utils as volume_utils
 
 LOG = logging.getLogger(__name__)
 
 image_helper_opt = [cfg.StrOpt('image_conversion_dir',
-                    default='/tmp',
-                    help='parent dir for tempdir used for image conversion'), ]
+                    default='$state_path/conversion',
+                    help='Directory used for temporary storage '
+                         'during image conversion'), ]
 
 CONF = cfg.CONF
 CONF.register_opts(image_helper_opt)
 
 
-class QemuImgInfo(object):
-    BACKING_FILE_RE = re.compile((r"^(.*?)\s*\(actual\s+path\s*:"
-                                  r"\s+(.*?)\)\s*$"), re.I)
-    TOP_LEVEL_RE = re.compile(r"^([\w\d\s\_\-]+):(.*)$")
-    SIZE_RE = re.compile(r"\(\s*(\d+)\s+bytes\s*\)", re.I)
-
-    def __init__(self, cmd_output):
-        details = self._parse(cmd_output)
-        self.image = details.get('image')
-        self.backing_file = details.get('backing_file')
-        self.file_format = details.get('file_format')
-        self.virtual_size = details.get('virtual_size')
-        self.cluster_size = details.get('cluster_size')
-        self.disk_size = details.get('disk_size')
-        self.snapshots = details.get('snapshot_list', [])
-        self.encryption = details.get('encryption')
-
-    def __str__(self):
-        lines = [
-            'image: %s' % self.image,
-            'file_format: %s' % self.file_format,
-            'virtual_size: %s' % self.virtual_size,
-            'disk_size: %s' % self.disk_size,
-            'cluster_size: %s' % self.cluster_size,
-            'backing_file: %s' % self.backing_file,
-        ]
-        if self.snapshots:
-            lines.append("snapshots: %s" % self.snapshots)
-        return "\n".join(lines)
-
-    def _canonicalize(self, field):
-        # Standardize on underscores/lc/no dash and no spaces
-        # since qemu seems to have mixed outputs here... and
-        # this format allows for better integration with python
-        # - ie for usage in kwargs and such...
-        field = field.lower().strip()
-        for c in (" ", "-"):
-            field = field.replace(c, '_')
-        return field
-
-    def _extract_bytes(self, details):
-        # Replace it with the byte amount
-        real_size = self.SIZE_RE.search(details)
-        if real_size:
-            details = real_size.group(1)
-        try:
-            details = strutils.to_bytes(details)
-        except TypeError:
-            pass
-        return details
-
-    def _extract_details(self, root_cmd, root_details, lines_after):
-        consumed_lines = 0
-        real_details = root_details
-        if root_cmd == 'backing_file':
-            # Replace it with the real backing file
-            backing_match = self.BACKING_FILE_RE.match(root_details)
-            if backing_match:
-                real_details = backing_match.group(2).strip()
-        elif root_cmd in ['virtual_size', 'cluster_size', 'disk_size']:
-            # Replace it with the byte amount (if we can convert it)
-            real_details = self._extract_bytes(root_details)
-        elif root_cmd == 'file_format':
-            real_details = real_details.strip().lower()
-        elif root_cmd == 'snapshot_list':
-            # Next line should be a header, starting with 'ID'
-            if not lines_after or not lines_after[0].startswith("ID"):
-                msg = _("Snapshot list encountered but no header found!")
-                raise ValueError(msg)
-            consumed_lines += 1
-            possible_contents = lines_after[1:]
-            real_details = []
-            # This is the sprintf pattern we will try to match
-            # "%-10s%-20s%7s%20s%15s"
-            # ID TAG VM SIZE DATE VM CLOCK (current header)
-            for line in possible_contents:
-                line_pieces = line.split(None)
-                if len(line_pieces) != 6:
-                    break
-                else:
-                    # Check against this pattern occuring in the final position
-                    # "%02d:%02d:%02d.%03d"
-                    date_pieces = line_pieces[5].split(":")
-                    if len(date_pieces) != 3:
-                        break
-                    real_details.append({
-                        'id': line_pieces[0],
-                        'tag': line_pieces[1],
-                        'vm_size': line_pieces[2],
-                        'date': line_pieces[3],
-                        'vm_clock': line_pieces[4] + " " + line_pieces[5],
-                    })
-                    consumed_lines += 1
-        return (real_details, consumed_lines)
-
-    def _parse(self, cmd_output):
-        # Analysis done of qemu-img.c to figure out what is going on here
-        # Find all points start with some chars and then a ':' then a newline
-        # and then handle the results of those 'top level' items in a separate
-        # function.
-        #
-        # TODO(harlowja): newer versions might have a json output format
-        #                 we should switch to that whenever possible.
-        #                 see: http://bit.ly/XLJXDX
-        if not cmd_output:
-            cmd_output = ''
-        contents = {}
-        lines = cmd_output.splitlines()
-        i = 0
-        line_am = len(lines)
-        while i < line_am:
-            line = lines[i]
-            if not line.strip():
-                i += 1
-                continue
-            consumed_lines = 0
-            top_level = self.TOP_LEVEL_RE.match(line)
-            if top_level:
-                root = self._canonicalize(top_level.group(1))
-                if not root:
-                    i += 1
-                    continue
-                root_details = top_level.group(2).strip()
-                details, consumed_lines = self._extract_details(root,
-                                                                root_details,
-                                                                lines[i + 1:])
-                contents[root] = details
-            i += consumed_lines + 1
-        return contents
-
-
 def qemu_img_info(path):
     """Return a object containing the parsed output from qemu-img info."""
-    out, err = utils.execute('env', 'LC_ALL=C', 'LANG=C',
-                             'qemu-img', 'info', path,
-                             run_as_root=True)
-    return QemuImgInfo(out)
+    cmd = ('env', 'LC_ALL=C', 'LANG=C', 'qemu-img', 'info', path)
+    if os.name == 'nt':
+        cmd = cmd[3:]
+    out, err = utils.execute(*cmd, run_as_root=True)
+    return imageutils.QemuImgInfo(out)
 
 
 def convert_image(source, dest, out_format):
@@ -232,22 +104,75 @@ def fetch_verify_image(context, image_service, image_id, dest,
                         {'fmt': fmt, 'backing_file': backing_file}))
 
 
+def fetch_to_vhd(context, image_service,
+                 image_id, dest,
+                 user_id=None, project_id=None):
+    fetch_to_volume_format(context, image_service, image_id, dest, 'vpc',
+                           user_id, project_id)
+
+
 def fetch_to_raw(context, image_service,
                  image_id, dest,
                  user_id=None, project_id=None):
+    fetch_to_volume_format(context, image_service, image_id, dest, 'raw',
+                           user_id, project_id)
+
+
+def fetch_to_volume_format(context, image_service,
+                           image_id, dest, volume_format,
+                           user_id=None, project_id=None):
     if (CONF.image_conversion_dir and not
             os.path.exists(CONF.image_conversion_dir)):
         os.makedirs(CONF.image_conversion_dir)
+
+    no_qemu_img = False
+    image_meta = image_service.show(context, image_id)
 
     # NOTE(avishay): I'm not crazy about creating temp files which may be
     # large and cause disk full errors which would confuse users.
     # Unfortunately it seems that you can't pipe to 'qemu-img convert' because
     # it seeks. Maybe we can think of something for a future version.
     with temporary_file() as tmp:
+        # We may be on a system that doesn't have qemu-img installed.  That
+        # is ok if we are working with a RAW image.  This logic checks to see
+        # if qemu-img is installed.  If not we make sure the image is RAW and
+        # throw an exception if not.  Otherwise we stop before needing
+        # qemu-img.  Systems with qemu-img will always progress through the
+        # whole function.
+        try:
+            # Use the empty tmp file to make sure qemu_img_info works.
+            qemu_img_info(tmp)
+        except processutils.ProcessExecutionError:
+            no_qemu_img = True
+            if image_meta:
+                if image_meta['disk_format'] != 'raw':
+                    raise exception.ImageUnacceptable(
+                        reason=_("qemu-img is not installed and image is of "
+                                 "type %s.  Only RAW images can be used if "
+                                 "qemu-img is not installed.") %
+                        image_meta['disk_format'],
+                        image_id=image_id)
+            else:
+                raise exception.ImageUnacceptable(
+                    reason=_("qemu-img is not installed and the disk "
+                             "format is not specified.  Only RAW images "
+                             "can be used if qemu-img is not installed."),
+                    image_id=image_id)
+
         fetch(context, image_service, image_id, tmp, user_id, project_id)
 
         if is_xenserver_image(context, image_service, image_id):
             replace_xenserver_image_with_coalesced_vhd(tmp)
+
+        if no_qemu_img:
+            # qemu-img is not installed but we do have a RAW image.  As a
+            # result we only need to copy the image to the destination and then
+            # return.
+            LOG.debug(_('Copying image from %(tmp)s to volume %(dest)s - '
+                        'size: %(size)s') % {'tmp': tmp, 'dest': dest,
+                                             'size': image_meta['size']})
+            volume_utils.copy_volume(tmp, dest, image_meta['size'])
+            return
 
         data = qemu_img_info(tmp)
         fmt = data.file_format
@@ -260,11 +185,8 @@ def fetch_to_raw(context, image_service,
         if backing_file is not None:
             raise exception.ImageUnacceptable(
                 image_id=image_id,
-                reason=_("fmt=%(fmt)s backed by:"
-                         "%(backing_file)s") % {
-                             'fmt': fmt,
-                             'backing_file': backing_file,
-                         })
+                reason=_("fmt=%(fmt)s backed by:%(backing_file)s")
+                % {'fmt': fmt, 'backing_file': backing_file, })
 
         # NOTE(jdg): I'm using qemu-img convert to write
         # to the volume regardless if it *needs* conversion or not
@@ -273,25 +195,33 @@ def fetch_to_raw(context, image_service,
         # check via 'qemu-img info' that what we copied was in fact a raw
         # image and not a different format with a backing file, which may be
         # malicious.
-        LOG.debug("%s was %s, converting to raw" % (image_id, fmt))
-        convert_image(tmp, dest, 'raw')
+        LOG.debug("%s was %s, converting to %s " % (image_id, fmt,
+                                                    volume_format))
+        convert_image(tmp, dest, volume_format)
 
         data = qemu_img_info(dest)
-        if data.file_format != "raw":
+        if data.file_format != volume_format:
             raise exception.ImageUnacceptable(
                 image_id=image_id,
-                reason=_("Converted to raw, but format is now %s") %
-                data.file_format)
+                reason=_("Converted to %(vol_format)s, but format is "
+                         "now %(file_format)s") % {'vol_format': volume_format,
+                                                   'file_format': data.
+                                                   file_format})
 
 
-def upload_volume(context, image_service, image_meta, volume_path):
+def upload_volume(context, image_service, image_meta, volume_path,
+                  volume_format='raw'):
     image_id = image_meta['id']
-    if (image_meta['disk_format'] == 'raw'):
-        LOG.debug("%s was raw, no need to convert to %s" %
-                  (image_id, image_meta['disk_format']))
-        with utils.temporary_chown(volume_path):
+    if (image_meta['disk_format'] == volume_format):
+        LOG.debug("%s was %s, no need to convert to %s" %
+                  (image_id, volume_format, image_meta['disk_format']))
+        if os.name == 'nt' or os.access(volume_path, os.R_OK):
             with fileutils.file_open(volume_path) as image_file:
                 image_service.update(context, image_id, {}, image_file)
+        else:
+            with utils.temporary_chown(volume_path):
+                with fileutils.file_open(volume_path) as image_file:
+                    image_service.update(context, image_id, {}, image_file)
         return
 
     if (CONF.image_conversion_dir and not
@@ -301,8 +231,8 @@ def upload_volume(context, image_service, image_meta, volume_path):
     fd, tmp = tempfile.mkstemp(dir=CONF.image_conversion_dir)
     os.close(fd)
     with fileutils.remove_path_on_error(tmp):
-        LOG.debug("%s was raw, converting to %s" %
-                  (image_id, image_meta['disk_format']))
+        LOG.debug("%s was %s, converting to %s" %
+                  (image_id, volume_format, image_meta['disk_format']))
         convert_image(volume_path, tmp, image_meta['disk_format'])
 
         data = qemu_img_info(tmp)

@@ -198,48 +198,6 @@ def model_query(context, *args, **kwargs):
     return query
 
 
-def exact_filter(query, model, filters, legal_keys):
-    """Applies exact match filtering to a query.
-
-    Returns the updated query.  Modifies filters argument to remove
-    filters consumed.
-
-    :param query: query to apply filters to
-    :param model: model object the query applies to, for IN-style
-                  filtering
-    :param filters: dictionary of filters; values that are lists,
-                    tuples, sets, or frozensets cause an 'IN' test to
-                    be performed, while exact matching ('==' operator)
-                    is used for other values
-    :param legal_keys: list of keys to apply exact filtering to
-    """
-
-    filter_dict = {}
-
-    # Walk through all the keys
-    for key in legal_keys:
-        # Skip ones we're not filtering on
-        if key not in filters:
-            continue
-
-        # OK, filtering on this key; what value do we search for?
-        value = filters.pop(key)
-
-        if isinstance(value, (list, tuple, set, frozenset)):
-            # Looking for values in a list; apply to query directly
-            column_attr = getattr(model, key)
-            query = query.filter(column_attr.in_(value))
-        else:
-            # OK, simple exact match; save for later
-            filter_dict[key] = value
-
-    # Apply simple exact matches
-    if filter_dict:
-        query = query.filter_by(**filter_dict)
-
-    return query
-
-
 def _sync_volumes(context, project_id, session, volume_type_id=None,
                   volume_type_name=None):
     (volumes, gigs) = _volume_data_get_for_project(
@@ -670,12 +628,6 @@ def _quota_usage_create(context, project_id, resource, in_use, reserved,
     return quota_usage_ref
 
 
-@require_admin_context
-def quota_usage_create(context, project_id, resource, in_use, reserved,
-                       until_refresh):
-    return _quota_usage_create(context, project_id, resource, in_use, reserved,
-                               until_refresh)
-
 ###################
 
 
@@ -1046,6 +998,8 @@ def volume_create(context, values):
         values['volume_admin_metadata'] = \
             _metadata_refs(values.get('admin_metadata'),
                            models.VolumeAdminMetadata)
+    elif values.get('volume_admin_metadata'):
+        del values['volume_admin_metadata']
 
     volume_ref = models.Volume()
     if not values.get('id'):
@@ -1098,28 +1052,27 @@ def volume_data_get_for_project(context, project_id, volume_type_id=None):
 
 @require_admin_context
 def finish_volume_migration(context, src_vol_id, dest_vol_id):
-    """Copy almost all columns from dest to source, then delete dest."""
+    """Copy almost all columns from dest to source."""
     session = get_session()
     with session.begin():
+        src_volume_ref = _volume_get(context, src_vol_id, session=session)
         dest_volume_ref = _volume_get(context, dest_vol_id, session=session)
-        updates = {}
-        if dest_volume_ref['_name_id']:
-            updates['_name_id'] = dest_volume_ref['_name_id']
-        else:
-            updates['_name_id'] = dest_volume_ref['id']
+
+        # NOTE(rpodolyaka): we should copy only column values, while model
+        #                   instances also have relationships attributes, which
+        #                   should be ignored
+        def is_column(inst, attr):
+            return attr in inst.__class__.__table__.columns
+
         for key, value in dest_volume_ref.iteritems():
-            if key in ['id', '_name_id']:
+            if key == 'id' or not is_column(dest_volume_ref, key):
                 continue
-            if key == 'migration_status':
-                updates[key] = None
-                continue
-            updates[key] = value
-        session.query(models.Volume).\
-            filter_by(id=src_vol_id).\
-            update(updates)
-        session.query(models.Volume).\
-            filter_by(id=dest_vol_id).\
-            delete()
+            elif key == 'migration_status':
+                value = None
+            elif key == '_name_id':
+                value = dest_volume_ref['_name_id'] or dest_volume_ref['id']
+
+            setattr(src_volume_ref, key, value)
 
 
 @require_admin_context
@@ -1584,6 +1537,7 @@ def snapshot_get_active_by_window(context, begin, end=None, project_id=None):
     query = model_query(context, models.Snapshot, read_deleted="yes")
     query = query.filter(or_(models.Snapshot.deleted_at == None,
                              models.Snapshot.deleted_at > begin))
+    query = query.options(joinedload(models.Snapshot.volume))
     if end:
         query = query.filter(models.Snapshot.created_at < end)
     if project_id:
@@ -1648,12 +1602,6 @@ def _snapshot_metadata_get_item(context, snapshot_id, key, session=None):
         raise exception.SnapshotMetadataNotFound(metadata_key=key,
                                                  snapshot_id=snapshot_id)
     return result
-
-
-@require_context
-@require_snapshot_exists
-def snapshot_metadata_get_item(context, snapshot_id, key):
-    return _snapshot_metadata_get_item(context, snapshot_id, key)
 
 
 @require_context
@@ -1733,9 +1681,7 @@ def volume_type_create(context, values):
 
 @require_context
 def volume_type_get_all(context, inactive=False, filters=None):
-    """
-    Returns a dict describing all volume_types with name as key.
-    """
+    """Returns a dict describing all volume_types with name as key."""
     filters = filters or {}
 
     read_deleted = "yes" if inactive else "no"
@@ -1852,9 +1798,11 @@ def volume_type_qos_specs_get(context, type_id):
                         'id': 'qos-specs-id',
                         'name': 'qos_specs_name',
                         'consumer': 'Consumer',
-                        'key1': 'value1',
-                        'key2': 'value2',
-                        'key3': 'value3'
+                        'specs': {
+                            'key1': 'value1',
+                            'key2': 'value2',
+                            'key3': 'value3'
+                        }
                      }
         }
 
@@ -1869,11 +1817,13 @@ def volume_type_qos_specs_get(context, type_id):
             first()
 
         # row.qos_specs is a list of QualityOfServiceSpecs ref
-        specs = {}
-        for item in row.qos_specs:
-            if item.key == 'QoS_Specs_Name':
-                if item.specs:
-                    specs = _dict_with_children_specs(item.specs)
+        specs = _dict_with_qos_specs(row.qos_specs)
+
+        if not specs:
+            # turn empty list to None
+            specs = None
+        else:
+            specs = specs[0]
 
         return {'qos_specs': specs}
 
@@ -1883,7 +1833,12 @@ def volume_type_destroy(context, id):
     session = get_session()
     with session.begin():
         _volume_type_get(context, id, session)
-
+        results = model_query(context, models.Volume, session=session). \
+            filter_by(volume_type_id=id).all()
+        if results:
+            msg = _('VolumeType %s deletion failed, VolumeType in use.') % id
+            LOG.error(msg)
+            raise exception.VolumeTypeInUse(volume_type_id=id)
         session.query(models.VolumeTypes).\
             filter_by(id=id).\
             update({'deleted': True,
@@ -1964,11 +1919,6 @@ def _volume_type_extra_specs_get_item(context, volume_type_id, key,
 
 
 @require_context
-def volume_type_extra_specs_get_item(context, volume_type_id, key):
-    return _volume_type_extra_specs_get_item(context, volume_type_id, key)
-
-
-@require_context
 def volume_type_extra_specs_update_or_create(context, volume_type_id,
                                              specs):
     session = get_session()
@@ -2021,7 +1971,7 @@ def qos_specs_create(context, values):
             # the name of QoS specs
             root['key'] = 'QoS_Specs_Name'
             root['value'] = values['name']
-            LOG.debug("qos_specs_create(): root %s", root)
+            LOG.debug("DB qos_specs_create(): root %s", root)
             specs_root.update(root)
             specs_root.save(session=session)
 
@@ -2035,7 +1985,7 @@ def qos_specs_create(context, values):
         except Exception as e:
             raise db_exc.DBError(e)
 
-        return specs_root
+        return dict(id=specs_root.id, name=specs_root.value)
 
 
 @require_admin_context
@@ -2071,27 +2021,33 @@ def _dict_with_children_specs(specs):
     """Convert specs list to a dict."""
     result = {}
     for spec in specs:
-        result.update({spec['key']: spec['value']})
+        # Skip deleted keys
+        if not spec['deleted']:
+            result.update({spec['key']: spec['value']})
 
     return result
 
 
 def _dict_with_qos_specs(rows):
-    """Convert qos specs query results to dict with name as key.
+    """Convert qos specs query results to list.
 
     Qos specs query results are a list of quality_of_service_specs refs,
     some are root entry of a qos specs (key == 'QoS_Specs_Name') and the
     rest are children entry, a.k.a detailed specs for a qos specs. This
-    funtion converts query results to a dict using spec name as key.
+    function converts query results to a dict using spec name as key.
     """
-    result = {}
+    result = []
     for row in rows:
         if row['key'] == 'QoS_Specs_Name':
-            result[row['value']] = dict(id=row['id'])
+            member = {}
+            member['name'] = row['value']
+            member.update(dict(id=row['id']))
             if row.specs:
                 spec_dict = _dict_with_children_specs(row.specs)
-                result[row['value']].update(spec_dict)
-
+                member.update(dict(consumer=spec_dict['consumer']))
+                del spec_dict['consumer']
+                member.update(dict(specs=spec_dict))
+            result.append(member)
     return result
 
 
@@ -2099,25 +2055,35 @@ def _dict_with_qos_specs(rows):
 def qos_specs_get(context, qos_specs_id, inactive=False):
     rows = _qos_specs_get_ref(context, qos_specs_id, None, inactive)
 
-    return _dict_with_qos_specs(rows)
+    return _dict_with_qos_specs(rows)[0]
 
 
 @require_admin_context
 def qos_specs_get_all(context, inactive=False, filters=None):
-    """Returns dicts describing all qos_specs.
+    """Returns a list of all qos_specs.
 
     Results is like:
-        {'qos-spec-1': {'id': SPECS-UUID,
-                        'key1': 'value1',
-                        'key2': 'value2',
-                        ...
-                        'consumer': 'back-end'}
-         'qos-spec-2': {'id': SPECS-UUID,
-                        'key1': 'value1',
-                        'key2': 'value2',
-                        ...
-                        'consumer': 'back-end'}
-        }
+        [{
+            'id': SPECS-UUID,
+            'name': 'qos_spec-1',
+            'consumer': 'back-end',
+            'specs': {
+                'key1': 'value1',
+                'key2': 'value2',
+                ...
+            }
+         },
+         {
+            'id': SPECS-UUID,
+            'name': 'qos_spec-2',
+            'consumer': 'front-end',
+            'specs': {
+                'key1': 'value1',
+                'key2': 'value2',
+                ...
+            }
+         },
+        ]
     """
     filters = filters or {}
     #TODO(zhiteng) Add filters for 'consumer'
@@ -2134,7 +2100,7 @@ def qos_specs_get_all(context, inactive=False, filters=None):
 def qos_specs_get_by_name(context, name, inactive=False):
     rows = _qos_specs_get_by_name(context, name, None, inactive)
 
-    return _dict_with_qos_specs(rows)
+    return _dict_with_qos_specs(rows)[0]
 
 
 @require_admin_context
@@ -2147,10 +2113,8 @@ def qos_specs_associations_get(context, qos_specs_id):
     extend qos specs association to other entities, such as volumes,
     sometime in future.
     """
-    rows = _qos_specs_get_ref(context, qos_specs_id, None)
-    if not rows:
-        raise exception.QoSSpecsNotFound(specs_id=qos_specs_id)
-
+    # Raise QoSSpecsNotFound if no specs found
+    _qos_specs_get_ref(context, qos_specs_id, None)
     return volume_type_qos_associations_get(context, qos_specs_id)
 
 
@@ -2181,12 +2145,15 @@ def qos_specs_disassociate_all(context, qos_specs_id):
 
 @require_admin_context
 def qos_specs_item_delete(context, qos_specs_id, key):
-    _qos_specs_get_item(context, qos_specs_id, key)
-    _qos_specs_get_ref(context, qos_specs_id, None). \
-        filter_by(key=key). \
-        update({'deleted': True,
-                'deleted_at': timeutils.utcnow(),
-                'updated_at': literal_column('updated_at')})
+    session = get_session()
+    with session.begin():
+        _qos_specs_get_item(context, qos_specs_id, key)
+        session.query(models.QualityOfServiceSpecs). \
+            filter(models.QualityOfServiceSpecs.key == key). \
+            filter(models.QualityOfServiceSpecs.specs_id == qos_specs_id). \
+            update({'deleted': True,
+                    'deleted_at': timeutils.utcnow(),
+                    'updated_at': literal_column('updated_at')})
 
 
 @require_admin_context
@@ -2369,8 +2336,8 @@ def volume_snapshot_glance_metadata_get(context, snapshot_id):
 @require_context
 @require_volume_exists
 def volume_glance_metadata_create(context, volume_id, key, value):
-    """
-    Update the Glance metadata for a volume by adding a new key:value pair.
+    """Update the Glance metadata for a volume by adding a new key:value pair.
+
     This API does not support changing the value of a key once it has been
     created.
     """
@@ -2399,10 +2366,11 @@ def volume_glance_metadata_create(context, volume_id, key, value):
 @require_context
 @require_snapshot_exists
 def volume_glance_metadata_copy_to_snapshot(context, snapshot_id, volume_id):
-    """
-    Update the Glance metadata for a snapshot by copying all of the key:value
-    pairs from the originating volume. This is so that a volume created from
-    the snapshot will retain the original metadata.
+    """Update the Glance metadata for a snapshot.
+
+    This copies all of the key:value pairs from the originating volume, to
+    ensure that a volume created from the snapshot will retain the
+    original metadata.
     """
 
     session = get_session()
@@ -2423,10 +2391,11 @@ def volume_glance_metadata_copy_to_snapshot(context, snapshot_id, volume_id):
 def volume_glance_metadata_copy_from_volume_to_volume(context,
                                                       src_volume_id,
                                                       volume_id):
-    """
-    Update the Glance metadata for a volume by copying all of the key:value
-    pairs from the originating volume. This is so that a volume created from
-    the volume (clone) will retain the original metadata.
+    """Update the Glance metadata for a volume.
+
+    This copies all all of the key:value pairs from the originating volume,
+    to ensure that a volume created from the volume (clone) will
+    retain the original metadata.
     """
 
     session = get_session()
@@ -2446,10 +2415,10 @@ def volume_glance_metadata_copy_from_volume_to_volume(context,
 @require_context
 @require_volume_exists
 def volume_glance_metadata_copy_to_volume(context, volume_id, snapshot_id):
-    """
-    Update the Glance metadata from a volume (created from a snapshot) by
-    copying all of the key:value pairs from the originating snapshot. This is
-    so that the Glance metadata from the original volume is retained.
+    """Update the Glance metadata from a volume (created from a snapshot) by
+    copying all of the key:value pairs from the originating snapshot.
+
+    This is so that the Glance metadata from the original volume is retained.
     """
 
     session = get_session()

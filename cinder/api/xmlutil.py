@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2011 OpenStack LLC.
+# Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -910,9 +910,7 @@ class TemplateBuilder(object):
 
 
 def make_links(parent, selector=None):
-    """
-    Attach an Atom <links> element to the parent.
-    """
+    """Attach an Atom <links> element to the parent."""
 
     elem = SubTemplateElement(parent, '{%s}link' % XMLNS_ATOM,
                               selector=selector)
@@ -925,14 +923,17 @@ def make_links(parent, selector=None):
 
 
 def make_flat_dict(name, selector=None, subselector=None, ns=None):
-    """
-    Utility for simple XML templates that traditionally used
-    XMLDictSerializer with no metadata.  Returns a template element
-    where the top-level element has the given tag name, and where
-    sub-elements have tag names derived from the object's keys and
-    text derived from the object's values.  This only works for flat
-    dictionary objects, not dictionaries containing nested lists or
-    dictionaries.
+    """Utility for simple XML templates.
+
+    Simple templates are templates that traditionally used
+    XMLDictSerializer with no metadata.
+
+    Returns a template element where the top-level element has the
+    given tag name, and where sub-elements have tag names derived
+    from the object's keys and text derived from the object's values.
+
+    This only works for flat dictionary objects, not dictionaries
+    containing nested lists or dictionaries.
     """
 
     # Set up the names we need...

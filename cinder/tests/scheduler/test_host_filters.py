@@ -1,4 +1,4 @@
-# Copyright 2011 OpenStack LLC.  # All Rights Reserved.
+# Copyright 2011 OpenStack Foundation  # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -34,9 +34,9 @@ DATA = ''
 
 
 def stub_out_https_backend(stubs):
-    """
-    Stubs out the httplib.HTTPRequest.getresponse to return
-    faked-out data instead of grabbing actual contents of a resource
+    """Stub out the httplib.HTTPRequest.getresponse.
+
+    return faked-out data instead of grabbing actual contents of a resource.
 
     The stubbed getresponse() returns an iterator over
     the data "I am a teapot, short and stout\n"

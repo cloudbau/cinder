@@ -4,7 +4,7 @@
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
 #
-# Copyright 2010 OpenStack, LLC
+# Copyright 2010 OpenStack Foundation
 # Copyright 2013 IBM Corp.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -67,7 +67,6 @@ def main(argv):
     install.check_dependencies()
     install.create_virtualenv(no_site_packages=options.no_site_packages)
     install.install_dependencies()
-    install.post_process()
     print_help()
 
 if __name__ == '__main__':

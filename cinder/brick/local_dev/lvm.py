@@ -22,7 +22,7 @@ LVM class for performing LVM operations.
 import math
 import re
 
-from itertools import izip
+import itertools
 
 from cinder.brick import exception
 from cinder.brick import executor
@@ -136,10 +136,12 @@ class LVM(executor.Executor):
         for line in lines:
             if 'LVM version' in line:
                 version_list = line.split()
+                # NOTE(gfidente): version is formatted as follows:
+                # major.minor.patchlevel(library API version)[-customisation]
                 version = version_list[2]
-                if '(2)' in version:
-                    version = version.replace('(2)', '')
-                version_tuple = tuple(map(int, version.split('.')))
+                version_filter = "(\d+)\.(\d+)\.(\d+).*"
+                r = re.search(version_filter, version)
+                version_tuple = tuple(map(int, r.group(1, 2, 3)))
                 if version_tuple >= (2, 2, 95):
                     return True
         return False
@@ -169,7 +171,7 @@ class LVM(executor.Executor):
         lv_list = []
         if out is not None:
             volumes = out.split()
-            for vg, name, size in izip(*[iter(volumes)] * 3):
+            for vg, name, size in itertools.izip(*[iter(volumes)] * 3):
                 lv_list.append({"vg": vg, "name": name, "size": size})
 
         return lv_list
@@ -250,10 +252,8 @@ class LVM(executor.Executor):
         :returns: List of Dictionaries with VG info
 
         """
-        cmd = ['vgs', '--noheadings',
-               '--unit=g', '-o',
-               'name,size,free,lv_count,uuid',
-               '--separator', ':']
+        cmd = ['env', 'LC_ALL=C', 'LANG=C', 'vgs', '--noheadings', '--unit=g',
+               '-o', 'name,size,free,lv_count,uuid', '--separator', ':']
 
         if no_suffix:
             cmd.append('--nosuffix')
@@ -337,7 +337,7 @@ class LVM(executor.Executor):
         self._execute(*cmd,
                       root_helper=self._root_helper,
                       run_as_root=True)
-        self.vg_thin_pool = pool_path
+        self.vg_thin_pool = name
 
     def create_volume(self, name, size_str, lv_type='default', mirror_count=0):
         """Creates a logical volume on the object's VG.
@@ -410,10 +410,26 @@ class LVM(executor.Executor):
         :param name: Name of LV to delete
 
         """
-        self._execute('lvremove',
-                      '-f',
-                      '%s/%s' % (self.vg_name, name),
-                      root_helper=self._root_helper, run_as_root=True)
+        try:
+            self._execute('lvremove',
+                          '-f',
+                          '%s/%s' % (self.vg_name, name),
+                          root_helper=self._root_helper, run_as_root=True)
+        except putils.ProcessExecutionError as err:
+            mesg = (_('Error reported running lvremove: CMD: %(command)s, '
+                    'RESPONSE: %(response)s') %
+                    {'command': err.cmd, 'response': err.stderr})
+            LOG.error(mesg)
+
+            LOG.warning(_('Attempting udev settle and retry of lvremove...'))
+            self._execute('udevadm', 'settle',
+                          root_helper=self._root_helper,
+                          run_as_root=True)
+
+            self._execute('lvremove',
+                          '-f',
+                          '%s/%s' % (self.vg_name, name),
+                          root_helper=self._root_helper, run_as_root=True)
 
     def revert(self, snapshot_name):
         """Revert an LV from snapshot.
@@ -436,3 +452,18 @@ class LVM(executor.Executor):
             if (out[0] == 'o') or (out[0] == 'O'):
                 return True
         return False
+
+    def extend_volume(self, lv_name, new_size):
+        """Extend the size of an existing volume."""
+
+        try:
+            self._execute('lvextend', '-L', new_size,
+                          '%s/%s' % (self.vg_name, lv_name),
+                          root_helper=self._root_helper,
+                          run_as_root=True)
+        except putils.ProcessExecutionError as err:
+            LOG.exception(_('Error extending Volume'))
+            LOG.error(_('Cmd     :%s') % err.cmd)
+            LOG.error(_('StdOut  :%s') % err.stdout)
+            LOG.error(_('StdErr  :%s') % err.stderr)
+            raise

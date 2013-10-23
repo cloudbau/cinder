@@ -1,7 +1,7 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 # Copyright (C) 2013 eBay Inc.
-# Copyright (C) 2013 OpenStack, LLC.
+# Copyright (C) 2013 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -40,7 +40,8 @@ def upgrade(migrate_engine):
                ForeignKey('quality_of_service_specs.id')),
         Column('key', String(255)),
         Column('value', String(255)),
-        mysql_engine='InnoDB'
+        mysql_engine='InnoDB',
+        mysql_charset='utf8'
     )
 
     try:

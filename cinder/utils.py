@@ -226,11 +226,12 @@ class SSHPool(pools.Pool):
             raise paramiko.SSHException(msg)
 
     def get(self):
-        """
-        Return an item from the pool, when one is available.  This may
-        cause the calling greenthread to block. Check if a connection is active
-        before returning it. For dead connections create and return a new
-        connection.
+        """Return an item from the pool, when one is available.
+
+        This may cause the calling greenthread to block. Check if a
+        connection is active before returning it.
+
+        For dead connections create and return a new connection.
         """
         conn = super(SSHPool, self).get()
         if conn:
@@ -776,12 +777,14 @@ def brick_get_connector_properties():
     """
 
     root_helper = get_root_helper()
-    return connector.get_connector_properties(root_helper)
+    return connector.get_connector_properties(root_helper,
+                                              CONF.my_ip)
 
 
 def brick_get_connector(protocol, driver=None,
                         execute=processutils.execute,
-                        use_multipath=False):
+                        use_multipath=False,
+                        device_scan_attempts=3):
     """Wrapper to get a brick connector object.
     This automatically populates the required protocol as well
     as the root_helper needed to execute commands.
@@ -791,4 +794,17 @@ def brick_get_connector(protocol, driver=None,
     return connector.InitiatorConnector.factory(protocol, root_helper,
                                                 driver=driver,
                                                 execute=execute,
-                                                use_multipath=use_multipath)
+                                                use_multipath=use_multipath,
+                                                device_scan_attempts=
+                                                device_scan_attempts)
+
+
+def require_driver_initialized(func):
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        # we can't do anything if the driver didn't init
+        if not self.driver.initialized:
+            driver_name = self.driver.__class__.__name__
+            raise exception.DriverNotInitialized(driver=driver_name)
+        return func(self, *args, **kwargs)
+    return wrapper

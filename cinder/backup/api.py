@@ -37,12 +37,12 @@ LOG = logging.getLogger(__name__)
 
 
 def check_policy(context, action):
-        target = {
-            'project_id': context.project_id,
-            'user_id': context.user_id,
-        }
-        _action = 'backup:%s' % action
-        cinder.policy.enforce(context, _action, target)
+    target = {
+        'project_id': context.project_id,
+        'user_id': context.user_id,
+    }
+    _action = 'backup:%s' % action
+    cinder.policy.enforce(context, _action, target)
 
 
 class API(base.Base):
@@ -59,9 +59,7 @@ class API(base.Base):
         return dict(rv.iteritems())
 
     def delete(self, context, backup_id):
-        """
-        Make the RPC call to delete a volume backup.
-        """
+        """Make the RPC call to delete a volume backup."""
         check_policy(context, 'delete')
         backup = self.get(context, backup_id)
         if backup['status'] not in ['available', 'error']:
@@ -74,7 +72,9 @@ class API(base.Base):
                                          backup['id'])
 
     # TODO(moorehef): Add support for search_opts, discarded atm
-    def get_all(self, context, search_opts={}):
+    def get_all(self, context, search_opts=None):
+        if search_opts is None:
+            search_opts = {}
         check_policy(context, 'get_all')
         if context.is_admin:
             backups = self.db.backup_get_all(context)
@@ -84,30 +84,30 @@ class API(base.Base):
 
         return backups
 
-    def _check_backup_service(self, volume):
-        """
-        Check if there is an backup service available
-        """
+    def _is_backup_service_enabled(self, volume, volume_host):
+        """Check if there is a backup service available."""
         topic = CONF.backup_topic
         ctxt = context.get_admin_context()
         services = self.db.service_get_all_by_topic(ctxt, topic)
         for srv in services:
             if (srv['availability_zone'] == volume['availability_zone'] and
-                    srv['host'] == volume['host'] and not srv['disabled'] and
+                    srv['host'] == volume_host and not srv['disabled'] and
                     utils.service_is_up(srv)):
                 return True
         return False
 
     def create(self, context, name, description, volume_id,
                container, availability_zone=None):
-        """
-        Make the RPC call to create a volume backup.
-        """
+        """Make the RPC call to create a volume backup."""
         check_policy(context, 'create')
         volume = self.volume_api.get(context, volume_id)
         if volume['status'] != "available":
             msg = _('Volume to be backed up must be available')
             raise exception.InvalidVolume(reason=msg)
+        volume_host = volume['host'].partition('@')[0]
+        if not self._is_backup_service_enabled(volume, volume_host):
+            raise exception.ServiceNotFound(service_id='cinder-backup')
+
         self.db.volume_update(context, volume_id, {'status': 'backing-up'})
 
         options = {'user_id': context.user_id,
@@ -118,13 +118,9 @@ class API(base.Base):
                    'status': 'creating',
                    'container': container,
                    'size': volume['size'],
-                   # TODO(DuncanT): This will need de-managling once
-                   #                multi-backend lands
-                   'host': volume['host'], }
+                   'host': volume_host, }
 
         backup = self.db.backup_create(context, options)
-        if not self._check_backup_service(volume):
-            raise exception.ServiceNotFound(service_id='cinder-backup')
 
         #TODO(DuncanT): In future, when we have a generic local attach,
         #               this can go via the scheduler, which enables
@@ -137,9 +133,7 @@ class API(base.Base):
         return backup
 
     def restore(self, context, backup_id, volume_id=None):
-        """
-        Make the RPC call to restore a volume backup.
-        """
+        """Make the RPC call to restore a volume backup."""
         check_policy(context, 'restore')
         backup = self.get(context, backup_id)
         if backup['status'] != 'available':

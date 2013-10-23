@@ -28,7 +28,6 @@ from oslo.config import cfg
 
 from cinder.brick import exception as brick_exception
 from cinder.brick.iscsi import iscsi
-from cinder.brick.iser import iser
 from cinder.brick.local_dev import lvm as lvm
 from cinder import exception
 from cinder.image import image_utils
@@ -56,7 +55,6 @@ volume_opts = [
     cfg.StrOpt('lvm_type',
                default='default',
                help='Type of LVM volumes to deploy; (default or thin)'),
-
 ]
 
 CONF = cfg.CONF
@@ -73,6 +71,9 @@ class LVMVolumeDriver(driver.VolumeDriver):
         self.configuration.append_config_values(volume_opts)
         self.hostname = socket.gethostname()
         self.vg = vg_obj
+        self.backend_name =\
+            self.configuration.safe_get('volume_backend_name') or 'LVM'
+        self.protocol = 'local'
 
     def set_execute(self, execute):
         self._execute = execute
@@ -80,7 +81,7 @@ class LVMVolumeDriver(driver.VolumeDriver):
     def check_for_setup_error(self):
         """Verify that requirements are in place to use LVM driver."""
         if self.vg is None:
-            root_helper = 'sudo cinder-rootwrap %s' % CONF.rootwrap_config
+            root_helper = utils.get_root_helper()
             try:
                 self.vg = lvm.LVM(self.configuration.volume_group,
                                   root_helper,
@@ -131,13 +132,7 @@ class LVMVolumeDriver(driver.VolumeDriver):
 
         # zero out old volumes to prevent data leaking between users
         # TODO(ja): reclaiming space should be done lazy and low priority
-        dev_path = self.local_path(volume)
-
-        # TODO(jdg): Maybe we could optimize this for snaps by looking at
-        # the cow table and only overwriting what's necessary?
-        # for now we're still skipping on snaps due to hang issue
-        if os.path.exists(dev_path) and not is_snapshot:
-            self.clear_volume(volume)
+        self.clear_volume(volume, is_snapshot)
         name = volume['name']
         if is_snapshot:
             name = self._escape_snapshot(volume['name'])
@@ -182,27 +177,52 @@ class LVMVolumeDriver(driver.VolumeDriver):
 
     def delete_volume(self, volume):
         """Deletes a logical volume."""
+
+        # NOTE(jdg):  We don't need to explicitly call
+        # remove export here because we already did it
+        # in the manager before we got here.
+
         if self._volume_not_present(volume['name']):
             # If the volume isn't present, then don't attempt to delete
             return True
 
         if self.vg.lv_has_snapshot(volume['name']):
+            LOG.error(_('Unabled to delete due to existing snapshot '
+                        'for volume: %s') % volume['name'])
             raise exception.VolumeIsBusy(volume_name=volume['name'])
 
         self._delete_volume(volume)
 
-    def clear_volume(self, volume):
+    def clear_volume(self, volume, is_snapshot=False):
         """unprovision old volumes to prevent data leaking between users."""
 
-        if self.configuration.volume_clear == 'none':
+        # NOTE(jdg): Don't write the blocks of thin provisioned
+        # volumes
+        if self.configuration.volume_clear == 'none' or \
+                self.configuration.lvm_type == 'thin':
             return
 
-        vol_path = self.local_path(volume)
+        if is_snapshot:
+            # if the volume to be cleared is a snapshot of another volume
+            # we need to clear out the volume using the -cow instead of the
+            # directly volume path.  We need to skip this if we are using
+            # thin provisioned LVs.
+            # bug# lp1191812
+            dev_path = self.local_path(volume) + "-cow"
+        else:
+            dev_path = self.local_path(volume)
+
+        if not os.path.exists(dev_path):
+            msg = (_('Volume device file path %s does not exist.') % dev_path)
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+
         size_in_g = volume.get('size', volume.get('volume_size', None))
         if size_in_g is None:
-            LOG.warning(_("Size for volume: %s not found, "
-                          "skipping secure delete.") % volume['id'])
-            return
+            msg = (_("Size for volume: %s not found, "
+                     "cannot secure delete.") % volume['id'])
+            LOG.error(msg)
+            raise exception.InvalidParameterValue(msg)
         size_in_m = self.configuration.volume_clear_size
 
         LOG.info(_("Performing secure delete on volume: %s") % volume['id'])
@@ -210,7 +230,7 @@ class LVMVolumeDriver(driver.VolumeDriver):
         if self.configuration.volume_clear == 'zero':
             if size_in_m == 0:
                 return volutils.copy_volume('/dev/zero',
-                                            vol_path, size_in_g * 1024,
+                                            dev_path, size_in_g * 1024,
                                             sync=True,
                                             execute=self._execute)
             else:
@@ -220,11 +240,11 @@ class LVMVolumeDriver(driver.VolumeDriver):
             if size_in_m:
                 clear_cmd.append('-s%dMiB' % size_in_m)
         else:
-            LOG.error(_("Error unrecognized volume_clear option: %s"),
-                      self.configuration.volume_clear)
-            return
+            raise exception.InvalidConfigurationValue(
+                option='volume_clear',
+                value=self.configuration.volume_clear)
 
-        clear_cmd.append(vol_path)
+        clear_cmd.append(dev_path)
         self._execute(*clear_cmd, run_as_root=True)
 
     def create_snapshot(self, snapshot):
@@ -322,28 +342,32 @@ class LVMVolumeDriver(driver.VolumeDriver):
         """
 
         if refresh:
-            self._update_volume_status()
-        self._update_volume_status()
+            self._update_volume_stats()
 
         return self._stats
 
-    def _update_volume_status(self):
-        """Retrieve status info from volume group."""
+    def _update_volume_stats(self):
+        """Retrieve stats info from volume group."""
 
-        # FIXME(jdg): Fix up the duplicate code between
-        # LVM, LVMISCSI and ISER starting with this section
-        LOG.debug(_("Updating volume status"))
+        LOG.debug(_("Updating volume stats"))
+        if self.vg is None:
+            LOG.warning(_('Unable to update stats on non-intialized '
+                          'Volume Group: %s'), self.configuration.volume_group)
+            return
+
+        self.vg.update_volume_group_info()
         data = {}
 
-        backend_name = self.configuration.safe_get('volume_backend_name')
-        data["volume_backend_name"] = backend_name or 'LVM'
+        # Note(zhiteng): These information are driver/backend specific,
+        # each driver may define these values in its own config options
+        # or fetch from driver specific configuration file.
+        data["volume_backend_name"] = self.backend_name
         data["vendor_name"] = 'Open Source'
         data["driver_version"] = self.VERSION
-        data["storage_protocol"] = 'local'
+        data["storage_protocol"] = self.protocol
 
-        data['total_capacity_gb'] = float(self.vg.vg_size.replace(',', '.'))
-        data['free_capacity_gb'] =\
-            float(self.vg.vg_free_space.replace(',', '.'))
+        data['total_capacity_gb'] = float(self.vg.vg_size)
+        data['free_capacity_gb'] = float(self.vg.vg_free_space)
         data['reserved_percentage'] = self.configuration.reserved_percentage
         data['QoS_support'] = False
         data['location_info'] =\
@@ -355,6 +379,11 @@ class LVMVolumeDriver(driver.VolumeDriver):
               'lvm_mirrors': self.configuration.lvm_mirrors})
 
         self._stats = data
+
+    def extend_volume(self, volume, new_size):
+        """Extend an existing voumes size."""
+        self.vg.extend_volume(volume['name'],
+                              self._sizestr(new_size))
 
 
 class LVMISCSIDriver(LVMVolumeDriver, driver.ISCSIDriver):
@@ -374,13 +403,49 @@ class LVMISCSIDriver(LVMVolumeDriver, driver.ISCSIDriver):
     """
 
     def __init__(self, *args, **kwargs):
-        root_helper = 'sudo cinder-rootwrap %s' % CONF.rootwrap_config
-        self.tgtadm = iscsi.get_target_admin(root_helper)
+        self.tgtadm = self.get_target_admin()
         super(LVMISCSIDriver, self).__init__(*args, **kwargs)
+        self.backend_name =\
+            self.configuration.safe_get('volume_backend_name') or 'LVM_iSCSI'
+        self.protocol = 'iSCSI'
 
     def set_execute(self, execute):
         super(LVMISCSIDriver, self).set_execute(execute)
         self.tgtadm.set_execute(execute)
+
+    def _create_tgtadm_target(self, iscsi_name, iscsi_target,
+                              volume_path, chap_auth, lun=0,
+                              check_exit_code=False, old_name=None):
+        # NOTE(jdg): tgt driver has an issue where with alot of activity
+        # (or sometimes just randomly) it will get *confused* and attempt
+        # to reuse a target ID, resulting in a target already exists error
+        # Typically a simple retry will address this
+
+        # For now we have this while loop, might be useful in the
+        # future to throw a retry decorator in common or utils
+        attempts = 2
+        while attempts > 0:
+            attempts -= 1
+            try:
+                # NOTE(jdg): For TgtAdm case iscsi_name is all we need
+                # should clean this all up at some point in the future
+                tid = self.tgtadm.create_iscsi_target(
+                    iscsi_name,
+                    iscsi_target,
+                    0,
+                    volume_path,
+                    chap_auth,
+                    check_exit_code=check_exit_code,
+                    old_name=old_name)
+                break
+
+            except brick_exception.ISCSITargetCreateFailed:
+                if attempts == 0:
+                    raise
+                else:
+                    LOG.warning(_('Error creating iSCSI target, retrying '
+                                  'creation for target: %s') % iscsi_name)
+        return tid
 
     def ensure_export(self, context, volume):
         """Synchronously recreates an export for a logical volume."""
@@ -409,9 +474,9 @@ class LVMISCSIDriver(LVMVolumeDriver, driver.ISCSIDriver):
                                           volume['name'])
             iscsi_target = 1
 
-            self.tgtadm.create_iscsi_target(iscsi_name, iscsi_target,
-                                            0, volume_path, chap_auth,
-                                            check_exit_code=False)
+            self._create_tgtadm_target(iscsi_name, iscsi_target,
+                                       volume_path, chap_auth)
+
             return
 
         if not isinstance(self.tgtadm, iscsi.TgtAdm):
@@ -448,10 +513,13 @@ class LVMISCSIDriver(LVMVolumeDriver, driver.ISCSIDriver):
 
         # NOTE(jdg): For TgtAdm case iscsi_name is the ONLY param we need
         # should clean this all up at some point in the future
-        self.tgtadm.create_iscsi_target(iscsi_name, iscsi_target,
-                                        0, volume_path, chap_auth,
-                                        check_exit_code=False,
-                                        old_name=old_name)
+        self._create_tgtadm_target(iscsi_name, iscsi_target,
+                                   volume_path, chap_auth,
+                                   lun=0,
+                                   check_exit_code=False,
+                                   old_name=old_name)
+
+        return
 
     def _fix_id_migration(self, context, volume):
         """Fix provider_location and dev files to address bug 1065702.
@@ -545,13 +613,10 @@ class LVMISCSIDriver(LVMVolumeDriver, driver.ISCSIDriver):
         chap_password = utils.generate_password()
         chap_auth = self._iscsi_authentication('IncomingUser', chap_username,
                                                chap_password)
-        # NOTE(jdg): For TgtAdm case iscsi_name is the ONLY param we need
-        # should clean this all up at some point in the future
-        tid = self.tgtadm.create_iscsi_target(iscsi_name,
-                                              iscsi_target,
-                                              0,
-                                              volume_path,
-                                              chap_auth)
+
+        tid = self._create_tgtadm_target(iscsi_name, iscsi_target,
+                                         volume_path, chap_auth)
+
         model_update['provider_location'] = self._iscsi_location(
             self.configuration.iscsi_ip_address, tid, iscsi_name, lun)
         model_update['provider_auth'] = self._iscsi_authentication(
@@ -642,7 +707,7 @@ class LVMISCSIDriver(LVMVolumeDriver, driver.ISCSIDriver):
                 LOG.error(_('%s'), message)
                 return false_ret
 
-            helper = 'sudo cinder-rootwrap %s' % CONF.rootwrap_config
+            helper = utils.get_root_helper()
             dest_vg_ref = lvm.LVM(dest_vg, helper, lvm_type, self._execute)
             self.remove_export(ctxt, volume)
             self._create_volume(volume['name'],
@@ -659,46 +724,6 @@ class LVMISCSIDriver(LVMVolumeDriver, driver.ISCSIDriver):
         model_update = self._create_export(ctxt, volume, vg=dest_vg)
 
         return (True, model_update)
-
-    def get_volume_stats(self, refresh=False):
-        """Get volume stats.
-
-        If 'refresh' is True, run update the stats first.
-        """
-        if refresh:
-            self._update_volume_stats()
-
-        return self._stats
-
-    def _update_volume_stats(self):
-        """Retrieve stats info from volume group."""
-
-        LOG.debug(_("Updating volume stats"))
-        self.vg.update_volume_group_info()
-        data = {}
-
-        # Note(zhiteng): These information are driver/backend specific,
-        # each driver may define these values in its own config options
-        # or fetch from driver specific configuration file.
-        backend_name = self.configuration.safe_get('volume_backend_name')
-        data["volume_backend_name"] = backend_name or 'LVM_iSCSI'
-        data["vendor_name"] = 'Open Source'
-        data["driver_version"] = self.VERSION
-        data["storage_protocol"] = 'iSCSI'
-
-        data['total_capacity_gb'] = float(self.vg.vg_size.replace(',', '.'))
-        data['free_capacity_gb'] = float(self.vg.vg_free_space)
-        data['reserved_percentage'] = self.configuration.reserved_percentage
-        data['QoS_support'] = False
-        data['location_info'] =\
-            ('LVMVolumeDriver:%(hostname)s:%(vg)s'
-             ':%(lvm_type)s:%(lvm_mirrors)s' %
-             {'hostname': self.hostname,
-              'vg': self.configuration.volume_group,
-              'lvm_type': self.configuration.lvm_type,
-              'lvm_mirrors': self.configuration.lvm_mirrors})
-
-        self._stats = data
 
     def _iscsi_location(self, ip, target, iqn, lun=None):
         return "%s:%s,%s %s %s" % (ip, self.configuration.iscsi_port,
@@ -725,9 +750,12 @@ class LVMISERDriver(LVMISCSIDriver, driver.ISERDriver):
     """
 
     def __init__(self, *args, **kwargs):
-        root_helper = 'sudo cinder-rootwrap %s' % CONF.rootwrap_config
-        self.tgtadm = iser.get_target_admin(root_helper)
+        self.tgtadm = self.get_target_admin()
         LVMVolumeDriver.__init__(self, *args, **kwargs)
+        self.backend_name =\
+            self.configuration.safe_get('volume_backend_name') or 'LVM_iSER'
+        self.protocol = 'iSER'
+        self.tgtadm.set_execute(self._execute)
 
     def set_execute(self, execute):
         LVMVolumeDriver.set_execute(self, execute)
@@ -736,7 +764,7 @@ class LVMISERDriver(LVMISCSIDriver, driver.ISERDriver):
     def ensure_export(self, context, volume):
         """Synchronously recreates an export for a logical volume."""
 
-        if not isinstance(self.tgtadm, iser.TgtAdm):
+        if not isinstance(self.tgtadm, iscsi.TgtAdm):
             try:
                 iser_target = self.db.volume_get_iscsi_target_num(
                     context,
@@ -763,19 +791,19 @@ class LVMISERDriver(LVMISCSIDriver, driver.ISERDriver):
                 volume_name = old_name
                 old_name = None
 
-        iser_name = "%s%s" % (self.configuration.iser_target_prefix,
+        iser_name = "%s%s" % (self.configuration.iscsi_target_prefix,
                               volume_name)
         volume_path = "/dev/%s/%s" % (self.configuration.volume_group,
                                       volume_name)
 
-        self.tgtadm.create_iser_target(iser_name, iser_target,
-                                       0, volume_path, chap_auth,
-                                       check_exit_code=False,
-                                       old_name=old_name)
+        self.tgtadm.create_iscsi_target(iser_name, iser_target,
+                                        0, volume_path, chap_auth,
+                                        check_exit_code=False,
+                                        old_name=old_name)
 
     def _ensure_iser_targets(self, context, host):
         """Ensure that target ids have been created in datastore."""
-        if not isinstance(self.tgtadm, iser.TgtAdm):
+        if not isinstance(self.tgtadm, iscsi.TgtAdm):
             host_iser_targets = self.db.iscsi_target_count_by_host(context,
                                                                    host)
             if host_iser_targets >= self.configuration.iser_num_targets:
@@ -790,7 +818,7 @@ class LVMISERDriver(LVMISCSIDriver, driver.ISERDriver):
     def create_export(self, context, volume):
         """Creates an export for a logical volume."""
 
-        iser_name = "%s%s" % (self.configuration.iser_target_prefix,
+        iser_name = "%s%s" % (self.configuration.iscsi_target_prefix,
                               volume['name'])
         volume_path = "/dev/%s/%s" % (self.configuration.volume_group,
                                       volume['name'])
@@ -798,7 +826,7 @@ class LVMISERDriver(LVMISCSIDriver, driver.ISERDriver):
 
         # TODO(jdg): In the future move all of the dependent stuff into the
         # cooresponding target admin class
-        if not isinstance(self.tgtadm, iser.TgtAdm):
+        if not isinstance(self.tgtadm, iscsi.TgtAdm):
             lun = 0
             self._ensure_iser_targets(context, volume['host'])
             iser_target = self.db.volume_allocate_iscsi_target(context,
@@ -813,13 +841,13 @@ class LVMISERDriver(LVMISCSIDriver, driver.ISERDriver):
         chap_password = utils.generate_password()
         chap_auth = self._iser_authentication('IncomingUser', chap_username,
                                               chap_password)
-        tid = self.tgtadm.create_iser_target(iser_name,
-                                             iser_target,
-                                             0,
-                                             volume_path,
-                                             chap_auth)
+        tid = self.tgtadm.create_iscsi_target(iser_name,
+                                              iser_target,
+                                              0,
+                                              volume_path,
+                                              chap_auth)
         model_update['provider_location'] = self._iser_location(
-            self.configuration.iser_ip_address, tid, iser_name, lun)
+            self.configuration.iscsi_ip_address, tid, iser_name, lun)
         model_update['provider_auth'] = self._iser_authentication(
             'CHAP', chap_username, chap_password)
         return model_update
@@ -827,7 +855,7 @@ class LVMISERDriver(LVMISCSIDriver, driver.ISERDriver):
     def remove_export(self, context, volume):
         """Removes an export for a logical volume."""
 
-        if not isinstance(self.tgtadm, iser.TgtAdm):
+        if not isinstance(self.tgtadm, iscsi.TgtAdm):
             try:
                 iser_target = self.db.volume_get_iscsi_target_num(
                     context,
@@ -853,35 +881,11 @@ class LVMISERDriver(LVMISCSIDriver, driver.ISERDriver):
                        "is presently exported for volume: %s"), volume['id'])
             return
 
-        self.tgtadm.remove_iser_target(iser_target, 0, volume['id'],
-                                       volume['name'])
-
-    def _update_volume_status(self):
-        """Retrieve status info from volume group."""
-
-        LOG.debug(_("Updating volume status"))
-        self.vg.update_volume_group_info()
-        data = {}
-
-        # Note(zhiteng): These information are driver/backend specific,
-        # each driver may define these values in its own config options
-        # or fetch from driver specific configuration file.
-        backend_name = self.configuration.safe_get('volume_backend_name')
-        data["volume_backend_name"] = backend_name or 'LVM_iSER'
-        data["vendor_name"] = 'Open Source'
-        data["driver_version"] = self.VERSION
-        data["storage_protocol"] = 'iSER'
-        data['total_capacity_gb'] = float(self.vg.vg_size.replace(',', '.'))
-        data['free_capacity_gb'] =\
-            float(self.vg.vg_free_space.replace(',', '.'))
-
-        data['reserved_percentage'] = self.configuration.reserved_percentage
-        data['QoS_support'] = False
-
-        self._stats = data
+        self.tgtadm.remove_iscsi_target(iser_target, 0, volume['id'],
+                                        volume['name'])
 
     def _iser_location(self, ip, target, iqn, lun=None):
-        return "%s:%s,%s %s %s" % (ip, self.configuration.iser_port,
+        return "%s:%s,%s %s %s" % (ip, self.configuration.iscsi_port,
                                    target, iqn, lun)
 
     def _iser_authentication(self, chap, name, password):

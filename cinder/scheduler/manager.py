@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010 OpenStack, LLC.
+# Copyright (c) 2010 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -62,14 +62,6 @@ class SchedulerManager(manager.Manager):
     def init_host(self):
         ctxt = context.get_admin_context()
         self.request_service_capabilities(ctxt)
-
-    def get_host_list(self, context):
-        """Get a list of hosts from the HostManager."""
-        return self.driver.get_host_list()
-
-    def get_service_capabilities(self, context):
-        """Get the normalized set of capabilities for this zone."""
-        return self.driver.get_service_capabilities()
 
     def update_service_capabilities(self, context, service_name=None,
                                     host=None, capabilities=None, **kwargs):

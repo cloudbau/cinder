@@ -28,6 +28,7 @@ from cinder.volume import driver
 from cinder.volume.drivers.vmware import api
 from cinder.volume.drivers.vmware import error_util
 from cinder.volume.drivers.vmware import vim
+from cinder.volume.drivers.vmware import vmware_images
 from cinder.volume.drivers.vmware import volumeops
 from cinder.volume import volume_types
 
@@ -63,7 +64,17 @@ vmdk_opts = [
     cfg.StrOpt('vmware_volume_folder',
                default='cinder-volumes',
                help='Name for the folder in the VC datacenter that will '
-                    'contain cinder volumes.')
+                    'contain cinder volumes.'),
+    cfg.IntOpt('vmware_image_transfer_timeout_secs',
+               default=7200,
+               help='Timeout in seconds for VMDK volume transfer between '
+                    'Cinder and Glance.'),
+    cfg.IntOpt('vmware_max_objects_retrieval',
+               default=100,
+               help='Max number of objects to be retrieved per batch. '
+                    'Query results will be obtained in batches from the '
+                    'server and not in one shot. Server may still limit the '
+                    'count to something less than the configured value.'),
 ]
 
 
@@ -131,7 +142,9 @@ class VMwareEsxVmdkDriver(driver.VolumeDriver):
     @property
     def volumeops(self):
         if not self._volumeops:
-            self._volumeops = volumeops.VMwareVolumeOps(self.session)
+            max_objects = self.configuration.vmware_max_objects_retrieval
+            self._volumeops = volumeops.VMwareVolumeOps(self.session,
+                                                        max_objects)
         return self._volumeops
 
     def do_setup(self, context):
@@ -149,7 +162,8 @@ class VMwareEsxVmdkDriver(driver.VolumeDriver):
                 raise exception.InvalidInput(_("%s not set.") % param)
 
         # Create the session object for the first time
-        self._volumeops = volumeops.VMwareVolumeOps(self.session)
+        max_objects = self.configuration.vmware_max_objects_retrieval
+        self._volumeops = volumeops.VMwareVolumeOps(self.session, max_objects)
         LOG.info(_("Successfully setup driver: %(driver)s for "
                    "server: %(ip)s.") %
                  {'driver': self.__class__.__name__,
@@ -311,30 +325,32 @@ class VMwareEsxVmdkDriver(driver.VolumeDriver):
         :param volume: Volume object
         :return: Reference to the created backing
         """
-        # Get all hosts
-        hosts = self.volumeops.get_hosts()
-        if not hosts:
-            msg = _("There are no hosts in the inventory.")
-            LOG.error(msg)
-            raise error_util.VimException(msg)
 
-        backing = None
-        for host in hosts:
-            try:
-                host = hosts[0].obj
-                backing = self._create_backing(volume, host)
+        retrv_result = self.volumeops.get_hosts()
+        while retrv_result:
+            hosts = retrv_result.objects
+            if not hosts:
                 break
-            except error_util.VimException as excep:
-                LOG.warn(_("Unable to find suitable datastore for "
-                           "volume: %(vol)s under host: %(host)s. "
-                           "More details: %(excep)s") %
-                         {'vol': volume['name'], 'host': host, 'excep': excep})
-        if backing:
-            return backing
-        msg = _("Unable to create volume: %(vol)s on the hosts: %(hosts)s.")
-        LOG.error(msg % {'vol': volume['name'], 'hosts': hosts})
-        raise error_util.VimException(msg %
-                                      {'vol': volume['name'], 'hosts': hosts})
+            backing = None
+            for host in hosts:
+                try:
+                    backing = self._create_backing(volume, host.obj)
+                    if backing:
+                        break
+                except error_util.VimException as excep:
+                    LOG.warn(_("Unable to find suitable datastore for "
+                               "volume: %(vol)s under host: %(host)s. "
+                               "More details: %(excep)s") %
+                             {'vol': volume['name'],
+                              'host': host.obj, 'excep': excep})
+            if backing:
+                self.volumeops.cancel_retrieval(retrv_result)
+                return backing
+            retrv_result = self.volumeops.continue_retrieval(retrv_result)
+
+        msg = _("Unable to create volume: %s in the inventory.")
+        LOG.error(msg % volume['name'])
+        raise error_util.VimException(msg % volume['name'])
 
     def _initialize_connection(self, volume, connector):
         """Get information of volume's backing.
@@ -421,9 +437,16 @@ class VMwareEsxVmdkDriver(driver.VolumeDriver):
 
         If the volume does not have a backing then simply pass, else create
         a snapshot.
+        Snapshot of only available volume is supported.
 
         :param snapshot: Snapshot object
         """
+
+        volume = snapshot['volume']
+        if volume['status'] != 'available':
+            msg = _("Snapshot of volume not supported in state: %s.")
+            LOG.error(msg % volume['status'])
+            raise exception.InvalidVolume(msg % volume['status'])
         backing = self.volumeops.get_backing(snapshot['volume_name'])
         if not backing:
             LOG.info(_("There is no backing, so will not create "
@@ -445,9 +468,16 @@ class VMwareEsxVmdkDriver(driver.VolumeDriver):
 
         If the volume does not have a backing or the snapshot does not exist
         then simply pass, else delete the snapshot.
+        Snapshot deletion of only available volume is supported.
 
         :param snapshot: Snapshot object
         """
+
+        volume = snapshot['volume']
+        if volume['status'] != 'available':
+            msg = _("Delete snapshot of volume not supported in state: %s.")
+            LOG.error(msg % volume['status'])
+            raise exception.InvalidVolume(msg % volume['status'])
         backing = self.volumeops.get_backing(snapshot['volume_name'])
         if not backing:
             LOG.info(_("There is no backing, and so there is no "
@@ -464,53 +494,39 @@ class VMwareEsxVmdkDriver(driver.VolumeDriver):
         """
         self._delete_snapshot(snapshot)
 
-    def _clone_backing_by_copying(self, volume, backing):
-        """Creates volume clone.
+    def _clone_backing_by_copying(self, volume, src_vmdk_path):
+        """Clones volume backing.
 
-        Here we copy the backing on a datastore under the host and then
-        register the copied backing to the inventory.
-        It is assumed here that all the source backing files are in the
-        same folder on the datastore.
+        Creates a backing for the input volume and replaces its VMDK file
+        with the input VMDK file copy.
 
         :param volume: New Volume object
-        :param backing: Reference to backing entity that must be cloned
-        :return: Reference to the cloned backing
+        :param src_vmdk_path: VMDK file path of the source volume backing
         """
-        src_path_name = self.volumeops.get_path_name(backing)
-        # If we have path like /vmfs/volumes/datastore/vm/vm.vmx
-        # we need to use /vmfs/volumes/datastore/vm/ are src_path
-        splits = src_path_name.split('/')
-        last_split = splits[len(splits) - 1]
-        src_path = src_path_name[:-len(last_split)]
-        # Pick a datastore where to create the full clone under same host
-        host = self.volumeops.get_host(backing)
-        (datastores, resource_pool) = self.volumeops.get_dss_rp(host)
-        (folder, summary) = self._get_folder_ds_summary(volume['size'],
-                                                        resource_pool,
-                                                        datastores)
-        dest_path = '[%s] %s' % (summary.name, volume['name'])
-        # Copy source backing files to a destination location
-        self.volumeops.copy_backing(src_path, dest_path)
-        # Register the backing to the inventory
-        dest_path_name = '%s/%s' % (dest_path, last_split)
-        clone = self.volumeops.register_backing(dest_path_name,
-                                                volume['name'], folder,
-                                                resource_pool)
-        LOG.info(_("Successfully cloned new backing: %s.") % clone)
-        return clone
+
+        # Create a backing
+        backing = self._create_backing_in_inventory(volume)
+        new_vmdk_path = self.volumeops.get_vmdk_path(backing)
+        datacenter = self.volumeops.get_dc(backing)
+        # Deleting the current VMDK file
+        self.volumeops.delete_vmdk_file(new_vmdk_path, datacenter)
+        # Copying the source VMDK file
+        self.volumeops.copy_vmdk_file(datacenter, src_vmdk_path, new_vmdk_path)
+        LOG.info(_("Successfully cloned new backing: %(back)s from "
+                   "source VMDK file: %(vmdk)s.") %
+                 {'back': backing, 'vmdk': src_vmdk_path})
 
     def _create_cloned_volume(self, volume, src_vref):
         """Creates volume clone.
 
         If source volume's backing does not exist, then pass.
-        Here we copy the backing on a datastore under the host and then
-        register the copied backing to the inventory.
-        It is assumed here that all the src_vref backing files are in the
-        same folder on the datastore.
+        Creates a backing and replaces its VMDK file with a copy of the
+        source backing's VMDK file.
 
         :param volume: New Volume object
         :param src_vref: Volume object that must be cloned
         """
+
         backing = self.volumeops.get_backing(src_vref['name'])
         if not backing:
             LOG.info(_("There is no backing for the source volume: "
@@ -519,7 +535,8 @@ class VMwareEsxVmdkDriver(driver.VolumeDriver):
                      {'svol': src_vref['name'],
                       'vol': volume['name']})
             return
-        self._clone_backing_by_copying(volume, backing)
+        src_vmdk_path = self.volumeops.get_vmdk_path(backing)
+        self._clone_backing_by_copying(volume, src_vmdk_path)
 
     def create_cloned_volume(self, volume, src_vref):
         """Creates volume clone.
@@ -534,12 +551,12 @@ class VMwareEsxVmdkDriver(driver.VolumeDriver):
 
         If the snapshot does not exist or source volume's backing does not
         exist, then pass.
-        Else we perform _create_cloned_volume and then revert the backing to
-        the appropriate snapshot point.
+        Else creates clone of source volume backing by copying its VMDK file.
 
         :param volume: Volume object
         :param snapshot: Snapshot object
         """
+
         backing = self.volumeops.get_backing(snapshot['volume_name'])
         if not backing:
             LOG.info(_("There is no backing for the source snapshot: "
@@ -556,13 +573,8 @@ class VMwareEsxVmdkDriver(driver.VolumeDriver):
                        "volume: %(vol)s.") %
                      {'snap': snapshot['name'], 'vol': volume['name']})
             return
-        clone = self._clone_backing_by_copying(volume, backing)
-        # Reverting the clone to the snapshot point.
-        snapshot_moref = self.volumeops.get_snapshot(clone, snapshot['name'])
-        self.volumeops.revert_to_snapshot(snapshot_moref)
-        LOG.info(_("Successfully reverted clone: %(clone)s to snapshot: "
-                   "%(snapshot)s.") %
-                 {'clone': clone, 'snapshot': snapshot_moref})
+        src_vmdk_path = self.volumeops.get_vmdk_path(snapshot_moref)
+        self._clone_backing_by_copying(volume, src_vmdk_path)
 
     def create_volume_from_snapshot(self, volume, snapshot):
         """Creates a volume from a snapshot.
@@ -571,6 +583,151 @@ class VMwareEsxVmdkDriver(driver.VolumeDriver):
         :param snapshot: Snapshot object
         """
         self._create_volume_from_snapshot(volume, snapshot)
+
+    def _get_ds_name_flat_vmdk_path(self, backing, vol_name):
+        """Get datastore name and folder path of the flat VMDK of the backing.
+
+        :param backing: Reference to the backing entity
+        :param vol_name: Name of the volume
+        :return: datastore name and folder path of the VMDK of the backing
+        """
+        file_path_name = self.volumeops.get_path_name(backing)
+        (datastore_name,
+         folder_path, _) = volumeops.split_datastore_path(file_path_name)
+        flat_vmdk_path = '%s%s-flat.vmdk' % (folder_path, vol_name)
+        return (datastore_name, flat_vmdk_path)
+
+    @staticmethod
+    def _validate_disk_format(disk_format):
+        """Verify vmdk as disk format.
+
+        :param disk_format: Disk format of the image
+        """
+        if disk_format and disk_format.lower() != 'vmdk':
+            msg = _("Cannot create image of disk format: %s. Only vmdk "
+                    "disk format is accepted.") % disk_format
+            LOG.error(msg)
+            raise exception.ImageUnacceptable(msg)
+
+    def copy_image_to_volume(self, context, volume, image_service, image_id):
+        """Creates volume from image.
+
+        Creates a backing for the volume under the ESX/VC server and
+        copies the VMDK flat file from the glance image content.
+        The method supports only image with VMDK disk format.
+
+        :param context: context
+        :param volume: Volume object
+        :param image_service: Glance image service
+        :param image_id: Glance image id
+        """
+        LOG.debug(_("Copy glance image: %s to create new volume.") % image_id)
+
+        # Verify glance image is vmdk disk format
+        metadata = image_service.show(context, image_id)
+        disk_format = metadata['disk_format']
+        VMwareEsxVmdkDriver._validate_disk_format(disk_format)
+
+        # Set volume size in GB from image metadata
+        volume['size'] = float(metadata['size']) / units.GiB
+        # First create empty backing in the inventory
+        backing = self._create_backing_in_inventory(volume)
+
+        try:
+            (datastore_name,
+             flat_vmdk_path) = self._get_ds_name_flat_vmdk_path(backing,
+                                                                volume['name'])
+            host = self.volumeops.get_host(backing)
+            datacenter = self.volumeops.get_dc(host)
+            datacenter_name = self.volumeops.get_entity_name(datacenter)
+            flat_vmdk_ds_path = '[%s] %s' % (datastore_name, flat_vmdk_path)
+            # Delete the *-flat.vmdk file within the backing
+            self.volumeops.delete_file(flat_vmdk_ds_path, datacenter)
+
+            # copy over image from glance into *-flat.vmdk
+            timeout = self.configuration.vmware_image_transfer_timeout_secs
+            host_ip = self.configuration.vmware_host_ip
+            cookies = self.session.vim.client.options.transport.cookiejar
+            LOG.debug(_("Fetching glance image: %(id)s to server: %(host)s.") %
+                      {'id': image_id, 'host': host_ip})
+            vmware_images.fetch_image(context, timeout, image_service,
+                                      image_id, host=host_ip,
+                                      data_center_name=datacenter_name,
+                                      datastore_name=datastore_name,
+                                      cookies=cookies,
+                                      file_path=flat_vmdk_path)
+            LOG.info(_("Done copying image: %(id)s to volume: %(vol)s.") %
+                     {'id': image_id, 'vol': volume['name']})
+        except Exception as excep:
+            LOG.exception(_("Exception in copy_image_to_volume: %(excep)s. "
+                            "Deleting the backing: %(back)s.") %
+                          {'excep': excep, 'back': backing})
+            # delete the backing
+            self.volumeops.delete_backing(backing)
+            raise excep
+
+    def copy_volume_to_image(self, context, volume, image_service, image_meta):
+        """Creates glance image from volume.
+
+        Upload of only available volume is supported.
+        Steps followed are:
+
+        1. Get the name of the vmdk file which the volume points to right now.
+           Can be a chain of snapshots, so we need to know the last in the
+           chain.
+        2. Call CopyVirtualDisk which coalesces the disk chain to form a
+           single vmdk, rather a .vmdk metadata file and a -flat.vmdk disk
+           data file.
+        3. Now upload the -flat.vmdk file to the image store.
+        4. Delete the coalesced .vmdk and -flat.vmdk created.
+        """
+
+        if volume['instance_uuid'] or volume['attached_host']:
+            msg = _("Upload to glance of attached volume is not supported.")
+            LOG.error(msg)
+            raise exception.InvalidVolume(msg)
+
+        LOG.debug(_("Copy Volume: %s to new image.") % volume['name'])
+        VMwareEsxVmdkDriver._validate_disk_format(image_meta['disk_format'])
+
+        backing = self.volumeops.get_backing(volume['name'])
+        if not backing:
+            LOG.info(_("Backing not found, creating for volume: %s") %
+                     volume['name'])
+            backing = self._create_backing_in_inventory(volume)
+
+        vmdk_file_path = self.volumeops.get_vmdk_path(backing)
+        datastore_name = volumeops.split_datastore_path(vmdk_file_path)[0]
+
+        # Create a copy of the vmdk into a tmp file
+        image_id = image_meta['id']
+        tmp_vmdk_file_path = '[%s] %s.vmdk' % (datastore_name, image_id)
+        host = self.volumeops.get_host(backing)
+        datacenter = self.volumeops.get_dc(host)
+        self.volumeops.copy_vmdk_file(datacenter, vmdk_file_path,
+                                      tmp_vmdk_file_path)
+        try:
+            # Upload image from copy of -flat.vmdk
+            timeout = self.configuration.vmware_image_transfer_timeout_secs
+            host_ip = self.configuration.vmware_host_ip
+            datacenter_name = self.volumeops.get_entity_name(datacenter)
+            cookies = self.session.vim.client.options.transport.cookiejar
+            flat_vmdk_copy = '%s-flat.vmdk' % image_id
+
+            vmware_images.upload_image(context, timeout, image_service,
+                                       image_meta['id'],
+                                       volume['project_id'], host=host_ip,
+                                       data_center_name=datacenter_name,
+                                       datastore_name=datastore_name,
+                                       cookies=cookies,
+                                       file_path=flat_vmdk_copy,
+                                       snapshot_name=image_meta['name'],
+                                       image_version=1)
+            LOG.info(_("Done copying volume %(vol)s to a new image %(img)s") %
+                     {'vol': volume['name'], 'img': image_meta['name']})
+        finally:
+            # Delete the coalesced .vmdk and -flat.vmdk created
+            self.volumeops.delete_vmdk_file(tmp_vmdk_file_path, datacenter)
 
 
 class VMwareVcVmdkDriver(VMwareEsxVmdkDriver):
@@ -699,10 +856,12 @@ class VMwareVcVmdkDriver(VMwareEsxVmdkDriver):
         """Creates volume clone.
 
         If source volume's backing does not exist, then pass.
+        Linked clone of attached volume is not supported.
 
         :param volume: New Volume object
         :param src_vref: Source Volume object
         """
+
         backing = self.volumeops.get_backing(src_vref['name'])
         if not backing:
             LOG.info(_("There is no backing for the source volume: %(src)s. "
@@ -712,6 +871,11 @@ class VMwareVcVmdkDriver(VMwareEsxVmdkDriver):
         clone_type = VMwareVcVmdkDriver._get_clone_type(volume)
         snapshot = None
         if clone_type == volumeops.LINKED_CLONE_TYPE:
+            if src_vref['status'] != 'available':
+                msg = _("Linked clone of source volume not supported "
+                        "in state: %s.")
+                LOG.error(msg % src_vref['status'])
+                raise exception.InvalidVolume(msg % src_vref['status'])
             # For performing a linked clone, we snapshot the volume and
             # then create the linked clone out of this snapshot point.
             name = 'snapshot-%s' % volume['id']

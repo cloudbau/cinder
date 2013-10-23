@@ -90,12 +90,12 @@ class SolidFireDriver(SanISCSIDriver):
     GB = math.pow(2, 30)
 
     def __init__(self, *args, **kwargs):
-            super(SolidFireDriver, self).__init__(*args, **kwargs)
-            self.configuration.append_config_values(sf_opts)
-            try:
-                self._update_cluster_status()
-            except exception.SolidFireAPIException:
-                pass
+        super(SolidFireDriver, self).__init__(*args, **kwargs)
+        self.configuration.append_config_values(sf_opts)
+        try:
+            self._update_cluster_status()
+        except exception.SolidFireAPIException:
+            pass
 
     def _issue_api_request(self, method_name, params, version='1.0'):
         """All API requests to SolidFire device go through this method.
@@ -347,8 +347,14 @@ class SolidFireDriver(SanISCSIDriver):
         if src_project_id != v_ref['project_id']:
             sfaccount = self._create_sfaccount(v_ref['project_id'])
 
+        if v_ref.get('size', None):
+            new_size = v_ref['size']
+        else:
+            new_size = v_ref['volume_size']
+
         params = {'volumeID': int(sf_vol['volumeID']),
                   'name': 'UUID-%s' % v_ref['id'],
+                  'newSize': int(new_size * self.GB),
                   'newAccountID': sfaccount['accountID']}
         data = self._issue_api_request('CloneVolume', params)
 

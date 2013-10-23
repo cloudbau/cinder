@@ -1,5 +1,5 @@
 # Copyright 2013 IBM Corp.
-# Copyright 2012 OpenStack LLC.
+# Copyright 2012 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -39,6 +39,7 @@ from cinder.volume import configuration as conf
 from cinder.volume.drivers import storwize_svc
 from cinder.volume import volume_types
 
+from eventlet import greenthread
 
 LOG = logging.getLogger(__name__)
 
@@ -483,7 +484,7 @@ port_speed!N/A
         host_infos = []
 
         for hk, hv in self._hosts_list.iteritems():
-            if not host_name or hv['host_name'] == host_name:
+            if not host_name or hv['host_name'].startswith(host_name):
                 for mk, mv in self._mappings_list.iteritems():
                     if mv['host'] == hv['host_name']:
                         if not target_wwpn or target_wwpn in hv['wwpns']:
@@ -741,8 +742,8 @@ port_speed!N/A
     def _cmd_lsiogrp(self, **kwargs):
         rows = [None] * 6
         rows[0] = ['id', 'name', 'node_count', 'vdisk_count', 'host_count']
-        rows[1] = ['0', 'io_grp0', '2', '22', '4']
-        rows[2] = ['1', 'io_grp1', '2', '22', '4']
+        rows[1] = ['0', 'io_grp0', '2', '0', '4']
+        rows[2] = ['1', 'io_grp1', '2', '0', '4']
         rows[3] = ['2', 'io_grp2', '0', '0', '4']
         rows[4] = ['3', 'io_grp3', '0', '0', '4']
         rows[5] = ['4', 'recovery_io_grp', '0', '0', '0']
@@ -968,7 +969,7 @@ port_speed!N/A
         for mapping_id in mapping_ids:
             if self._mappings_list[mapping_id]['host'] == host:
                 this_mapping = mapping_id
-        if this_mapping == None:
+        if this_mapping is None:
             return self._errors['CMMVC5753E']
 
         del self._mappings_list[this_mapping]
@@ -1165,7 +1166,7 @@ port_speed!N/A
                                 'no'])
 
         for d in to_delete:
-            del self._fcmappings_list[k]
+            del self._fcmappings_list[d]
 
         return self._print_info_cmd(rows=rows, **kwargs)
 
@@ -1309,6 +1310,12 @@ port_speed!N/A
         if 'wwpns' in connector:
             host_info['wwpns'] = host_info['wwpns'] + connector['wwpns']
         self._hosts_list[connector['host']] = host_info
+
+    def _host_in_list(self, host_name):
+        for k, v in self._hosts_list.iteritems():
+            if k.startswith(host_name):
+                return k
+        return None
 
     # The main function to run commands on the management simulator
     def execute_command(self, cmd, check_exit_code=True):
@@ -1479,6 +1486,8 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         self.driver.do_setup(None)
         self.driver.check_for_setup_error()
         self.stubs.Set(storwize_svc.time, 'sleep', lambda s: None)
+        self.stubs.Set(greenthread, 'sleep', lambda *x, **y: None)
+        self.stubs.Set(storwize_svc, 'CHECK_FCMAPPING_INTERVAL', 0)
 
     def _set_flag(self, flag, value):
         group = self.driver.configuration.config_group
@@ -1839,16 +1848,16 @@ class StorwizeSVCDriverTestCase(test.TestCase):
                 'host': u'unicode.foo}.bar}.baz-%s' % rand_id}
         self.driver.initialize_connection(volume1, conn)
         host_name = self.driver._get_host_from_connector(conn)
-        self.assertNotEqual(host_name, None)
+        self.assertIsNotNone(host_name)
         self.driver.terminate_connection(volume1, conn)
         host_name = self.driver._get_host_from_connector(conn)
-        self.assertEqual(host_name, None)
+        self.assertIsNone(host_name)
         self.driver.delete_volume(volume1)
 
         # Clean up temporary hosts
         for tmpconn in [tmpconn1, tmpconn2]:
             host_name = self.driver._get_host_from_connector(tmpconn)
-            self.assertNotEqual(host_name, None)
+            self.assertIsNotNone(host_name)
             self.driver._delete_host(host_name)
 
     def test_storwize_svc_validate_connector(self):
@@ -1902,7 +1911,7 @@ class StorwizeSVCDriverTestCase(test.TestCase):
             # Check case where no hosts exist
             if self.USESIM:
                 ret = self.driver._get_host_from_connector(self._connector)
-                self.assertEqual(ret, None)
+                self.assertIsNone(ret)
 
             # Make sure that the volumes have been created
             self._assert_vol_exists(volume1['name'], True)
@@ -1930,23 +1939,39 @@ class StorwizeSVCDriverTestCase(test.TestCase):
             self.driver.terminate_connection(volume1, self._connector)
             if self.USESIM:
                 ret = self.driver._get_host_from_connector(self._connector)
-                self.assertEqual(ret, None)
+                self.assertIsNone(ret)
 
         # Check cases with no auth set for host
         if self.USESIM:
-            for case in ['no_info', 'no_auth_set']:
-                conn_na = {'initiator': 'test:init:%s' %
-                                        random.randint(10000, 99999),
-                           'ip': '11.11.11.11',
-                           'host': 'host-%s' % case}
-                self.sim._add_host_to_list(conn_na)
-                volume1['volume_type_id'] = types['iSCSI']['id']
-                if case == 'no_info':
-                    self.sim.error_injection('lsiscsiauth', 'no_info')
-                self.driver.initialize_connection(volume1, conn_na)
-                ret = self.driver._get_chap_secret_for_host(conn_na['host'])
-                self.assertNotEqual(ret, None)
-                self.driver.terminate_connection(volume1, conn_na)
+            for auth_enabled in [True, False]:
+                for host_exists in ['yes-auth', 'yes-noauth', 'no']:
+                    self._set_flag('storwize_svc_iscsi_chap_enabled',
+                                   auth_enabled)
+                    case = 'en' + str(auth_enabled) + 'ex' + str(host_exists)
+                    conn_na = {'initiator': 'test:init:%s' %
+                                            random.randint(10000, 99999),
+                               'ip': '11.11.11.11',
+                               'host': 'host-%s' % case}
+                    if host_exists.startswith('yes'):
+                        self.sim._add_host_to_list(conn_na)
+                        if host_exists == 'yes-auth':
+                            kwargs = {'chapsecret': 'foo',
+                                      'obj': conn_na['host']}
+                            self.sim._cmd_chhost(**kwargs)
+                    volume1['volume_type_id'] = types['iSCSI']['id']
+
+                    init_ret = self.driver.initialize_connection(volume1,
+                                                                 conn_na)
+                    host_name = self.sim._host_in_list(conn_na['host'])
+                    chap_ret = self.driver._get_chap_secret_for_host(host_name)
+                    if auth_enabled or host_exists == 'yes-auth':
+                        self.assertIn('auth_password', init_ret['data'])
+                        self.assertIsNotNone(chap_ret)
+                    else:
+                        self.assertNotIn('auth_password', init_ret['data'])
+                        self.assertIsNone(chap_ret)
+                    self.driver.terminate_connection(volume1, conn_na)
+        self._set_flag('storwize_svc_iscsi_chap_enabled', True)
 
         # Test no preferred node
         if self.USESIM:
@@ -1983,7 +2008,7 @@ class StorwizeSVCDriverTestCase(test.TestCase):
 
         # Make sure our host still exists
         host_name = self.driver._get_host_from_connector(self._connector)
-        self.assertNotEqual(host_name, None)
+        self.assertIsNotNone(host_name)
 
         # Remove the mapping from the 2nd volume and delete it. The host should
         # be automatically removed because there are no more mappings.
@@ -1998,7 +2023,7 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         # Check if our host still exists (it should not)
         if self.USESIM:
             ret = self.driver._get_host_from_connector(self._connector)
-            self.assertEqual(ret, None)
+            self.assertIsNone(ret)
 
     def test_storwize_svc_multi_host_maps(self):
         # We can't test connecting to multiple hosts from a single host when
@@ -2130,7 +2155,7 @@ class StorwizeSVCDriverTestCase(test.TestCase):
         stats = self.driver.get_volume_stats()
         self.assertLessEqual(stats['free_capacity_gb'],
                              stats['total_capacity_gb'])
-        self.assertEquals(stats['reserved_percentage'], 25)
+        self.assertEqual(stats['reserved_percentage'], 25)
         pool = self.driver.configuration.local_conf.storwize_svc_volpool_name
         if self.USESIM:
             expected = 'storwize-svc-sim_' + pool

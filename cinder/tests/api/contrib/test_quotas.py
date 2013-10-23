@@ -118,5 +118,5 @@ class QuotaSerializerTest(test.TestCase):
         self.assertEqual(tree.get('id'), quota_set['id'])
         body = make_body(root=False, tenant_id=None)
         for node in tree:
-            self.assertTrue(node.tag in body)
-            self.assertEquals(str(body[node.tag]), node.text)
+            self.assertIn(node.tag, body)
+            self.assertEqual(str(body[node.tag]), node.text)

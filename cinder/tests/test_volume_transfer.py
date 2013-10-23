@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2013 OpenStack LLC.
+# Copyright (c) 2013 OpenStack Foundation
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
@@ -22,6 +22,7 @@ from cinder import db
 from cinder import exception
 from cinder.openstack.common import log as logging
 from cinder import test
+from cinder.tests import utils
 from cinder.transfer import api as transfer_api
 
 
@@ -34,54 +35,39 @@ class VolumeTransferTestCase(test.TestCase):
         super(VolumeTransferTestCase, self).setUp()
         self.ctxt = context.RequestContext(user_id='user_id',
                                            project_id='project_id')
-
-    def _create_volume(self, volume_id, status='available',
-                       user_id=None, project_id=None):
-        if user_id is None:
-            user_id = self.ctxt.user_id
-        if project_id is None:
-            project_id = self.ctxt.project_id
-        vol = {'id': volume_id,
-               'updated_at': datetime.datetime(1, 1, 1, 1, 1, 1),
-               'user_id': user_id,
-               'project_id': project_id,
-               'display_name': 'Display Name',
-               'display_description': 'Display Description',
-               'size': 1,
-               'status': status}
-        volume = db.volume_create(self.ctxt, vol)
-        return volume
+        self.updated_at = datetime.datetime(1, 1, 1, 1, 1, 1)
 
     def test_transfer_volume_create_delete(self):
         tx_api = transfer_api.API()
-        volume = self._create_volume('1')
+        volume = utils.create_volume(self.ctxt, id='1',
+                                     updated_at=self.updated_at)
         response = tx_api.create(self.ctxt, '1', 'Description')
         volume = db.volume_get(self.ctxt, '1')
-        self.assertEquals('awaiting-transfer', volume['status'],
-                          'Unexpected state')
+        self.assertEqual('awaiting-transfer', volume['status'],
+                         'Unexpected state')
 
         tx_api.delete(self.ctxt, response['id'])
         volume = db.volume_get(self.ctxt, '1')
-        self.assertEquals('available', volume['status'],
-                          'Unexpected state')
+        self.assertEqual('available', volume['status'], 'Unexpected state')
 
     def test_transfer_invalid_volume(self):
         tx_api = transfer_api.API()
-        volume = self._create_volume('1', status='in-use')
+        volume = utils.create_volume(self.ctxt, id='1', status='in-use',
+                                     updated_at=self.updated_at)
         self.assertRaises(exception.InvalidVolume,
                           tx_api.create,
                           self.ctxt, '1', 'Description')
         volume = db.volume_get(self.ctxt, '1')
-        self.assertEquals('in-use', volume['status'],
-                          'Unexpected state')
+        self.assertEqual('in-use', volume['status'], 'Unexpected state')
 
     def test_transfer_accept(self):
         tx_api = transfer_api.API()
-        volume = self._create_volume('1')
+        volume = utils.create_volume(self.ctxt, id='1',
+                                     updated_at=self.updated_at)
         transfer = tx_api.create(self.ctxt, '1', 'Description')
         volume = db.volume_get(self.ctxt, '1')
-        self.assertEquals('awaiting-transfer', volume['status'],
-                          'Unexpected state')
+        self.assertEqual('awaiting-transfer', volume['status'],
+                         'Unexpected state')
 
         self.assertRaises(exception.TransferNotFound,
                           tx_api.accept,
@@ -103,25 +89,26 @@ class VolumeTransferTestCase(test.TestCase):
                                  transfer['id'],
                                  transfer['auth_key'])
         volume = db.volume_get(self.ctxt, '1')
-        self.assertEquals(volume['project_id'], 'new_project_id',
-                          'Unexpected project id')
-        self.assertEquals(volume['user_id'], 'new_user_id',
-                          'Unexpected user id')
+        self.assertEqual(volume['project_id'], 'new_project_id',
+                         'Unexpected project id')
+        self.assertEqual(volume['user_id'], 'new_user_id',
+                         'Unexpected user id')
 
-        self.assertEquals(volume['id'], response['volume_id'],
-                          'Unexpected volume id in response.')
-        self.assertEquals(transfer['id'], response['id'],
-                          'Unexpected transfer id in response.')
+        self.assertEqual(volume['id'], response['volume_id'],
+                         'Unexpected volume id in response.')
+        self.assertEqual(transfer['id'], response['id'],
+                         'Unexpected transfer id in response.')
 
     def test_transfer_get(self):
         tx_api = transfer_api.API()
-        volume = self._create_volume('1')
+        volume = utils.create_volume(self.ctxt, id='1',
+                                     updated_at=self.updated_at)
         transfer = tx_api.create(self.ctxt, volume['id'], 'Description')
         t = tx_api.get(self.ctxt, transfer['id'])
-        self.assertEquals(t['id'], transfer['id'], 'Unexpected transfer id')
+        self.assertEqual(t['id'], transfer['id'], 'Unexpected transfer id')
 
         ts = tx_api.get_all(self.ctxt)
-        self.assertEquals(len(ts), 1, 'Unexpected number of transfers.')
+        self.assertEqual(len(ts), 1, 'Unexpected number of transfers.')
 
         nctxt = context.RequestContext(user_id='new_user_id',
                                        project_id='new_project_id')
@@ -131,4 +118,4 @@ class VolumeTransferTestCase(test.TestCase):
                           transfer['id'])
 
         ts = tx_api.get_all(nctxt)
-        self.assertEquals(len(ts), 0, 'Unexpected transfers listed.')
+        self.assertEqual(len(ts), 0, 'Unexpected transfers listed.')

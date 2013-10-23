@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2010 OpenStack LLC.
+# Copyright 2010 OpenStack Foundation
 # Copyright 2013 NTT corp.
 # All Rights Reserved.
 #
@@ -24,11 +24,11 @@ from __future__ import absolute_import
 import copy
 import itertools
 import random
+import shutil
 import sys
 import time
 import urlparse
 
-import glanceclient
 import glanceclient.exc
 from oslo.config import cfg
 
@@ -37,8 +37,15 @@ from cinder.openstack.common import jsonutils
 from cinder.openstack.common import log as logging
 from cinder.openstack.common import timeutils
 
-
+glance_opts = [
+    cfg.ListOpt('allowed_direct_url_schemes',
+                default=[],
+                help='A list of url schemes that can be downloaded directly '
+                     'via the direct_url.  Currently supported schemes: '
+                     '[file].'),
+]
 CONF = cfg.CONF
+CONF.register_opts(glance_opts)
 
 LOG = logging.getLogger(__name__)
 
@@ -155,23 +162,20 @@ class GlanceClientWrapper(object):
                 extra = "retrying"
                 error_msg = _("Error contacting glance server "
                               "'%(netloc)s' for '%(method)s', "
-                              "%(extra)s.") % {
-                                  'netloc': netloc,
-                                  'method': method,
-                                  'extra': extra,
-                              }
+                              "%(extra)s.") % {'netloc': netloc,
+                                               'method': method,
+                                               'extra': extra,
+                                               }
                 if attempt == num_attempts:
                     extra = 'done trying'
                     error_msg = _("Error contacting glance server "
                                   "'%(netloc)s' for '%(method)s', "
-                                  "%(extra)s.") % {
-                                      'netloc': netloc,
-                                      'method': method,
-                                      'extra': extra,
-                                  }
+                                  "%(extra)s.") % {'netloc': netloc,
+                                                   'method': method,
+                                                   'extra': extra,
+                                                   }
                     LOG.exception(error_msg)
-                    raise exception.GlanceConnectionFailed(netloc=netloc,
-                                                           reason=str(e))
+                    raise exception.GlanceConnectionFailed(reason=str(e))
                 LOG.exception(error_msg)
                 time.sleep(1)
 
@@ -230,7 +234,8 @@ class GlanceImageService(object):
         or None if this attribute is not shown by Glance.
         """
         try:
-            client = GlanceClientWrapper()
+            # direct_url is returned by v2 api
+            client = GlanceClientWrapper(version=2)
             image_meta = client.call(context, 'get', image_id)
         except Exception:
             _reraise_translated_image_exception(image_id)
@@ -238,17 +243,35 @@ class GlanceImageService(object):
         if not self._is_image_available(context, image_meta):
             raise exception.ImageNotFound(image_id=image_id)
 
-        return getattr(image_meta, 'direct_url', None)
+        # some glance stores like nfs only meta data
+        # is stored and returned as locations.
+        # so composite of two needs to be returned.
+        return (getattr(image_meta, 'direct_url', None),
+                getattr(image_meta, 'locations', None))
 
-    def download(self, context, image_id, data):
-        """Calls out to Glance for metadata and data and writes data."""
+    def download(self, context, image_id, data=None):
+        """Calls out to Glance for data and writes data."""
+        if 'file' in CONF.allowed_direct_url_schemes:
+            location = self.get_location(context, image_id)
+            o = urlparse.urlparse(location)
+            if o.scheme == "file":
+                with open(o.path, "r") as f:
+                    # a system call to cp could have significant performance
+                    # advantages, however we do not have the path to files at
+                    # this point in the abstraction.
+                    shutil.copyfileobj(f, data)
+                return
+
         try:
             image_chunks = self._client.call(context, 'data', image_id)
         except Exception:
             _reraise_translated_image_exception(image_id)
 
-        for chunk in image_chunks:
-            data.write(chunk)
+        if not data:
+            return image_chunks
+        else:
+            for chunk in image_chunks:
+                data.write(chunk)
 
     def create(self, context, image_meta, data=None):
         """Store the image data and return the new image object."""

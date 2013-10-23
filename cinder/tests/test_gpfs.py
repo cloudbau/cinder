@@ -27,6 +27,7 @@ from cinder.openstack.common import importutils
 from cinder.openstack.common import log as logging
 from cinder.openstack.common import processutils
 from cinder import test
+from cinder.tests import utils as test_utils
 from cinder import utils
 from cinder.volume import configuration as conf
 from cinder.volume.drivers.gpfs import GPFSDriver
@@ -85,6 +86,7 @@ class GPFSDriverTestCase(test.TestCase):
                    gpfs_mount_point_base=self.volumes_path)
         self.volume = importutils.import_object(CONF.volume_manager)
         self.volume.driver.set_execute(self._execute_wrapper)
+        self.volume.driver.set_initialized()
 
         self.stubs.Set(GPFSDriver, '_create_gpfs_snap',
                        self._fake_gpfs_snap)
@@ -112,6 +114,8 @@ class GPFSDriverTestCase(test.TestCase):
                        self._fake_qemu_image_resize)
 
         self.context = context.get_admin_context()
+        self.context.user_id = 'fake'
+        self.context.project_id = 'fake'
         CONF.gpfs_images_dir = self.images_dir
 
     def tearDown(self):
@@ -122,27 +126,10 @@ class GPFSDriverTestCase(test.TestCase):
             pass
         super(GPFSDriverTestCase, self).tearDown()
 
-    def _create_volume(self, size=0, snapshot_id=None, image_id=None,
-                       metadata=None):
-        """Create a volume object."""
-        vol = {}
-        vol['size'] = size
-        vol['snapshot_id'] = snapshot_id
-        vol['image_id'] = image_id
-        vol['user_id'] = 'fake'
-        vol['project_id'] = 'fake'
-        vol['availability_zone'] = CONF.storage_availability_zone
-        vol['status'] = "creating"
-        vol['attach_status'] = "detached"
-        vol['host'] = CONF.host
-        if metadata is not None:
-            vol['metadata'] = metadata
-        return db.volume_create(context.get_admin_context(), vol)
-
     def test_create_delete_volume_full_backing_file(self):
         """create and delete vol with full creation method"""
         CONF.gpfs_sparse_volumes = False
-        vol = self._create_volume(size=1)
+        vol = test_utils.create_volume(self.context, host=CONF.host)
         volume_id = vol['id']
         self.assertTrue(os.path.exists(self.volumes_path))
         self.volume.create_volume(self.context, volume_id)
@@ -154,7 +141,7 @@ class GPFSDriverTestCase(test.TestCase):
     def test_create_delete_volume_sparse_backing_file(self):
         """create and delete vol with default sparse creation method"""
         CONF.gpfs_sparse_volumes = True
-        vol = self._create_volume(size=1)
+        vol = test_utils.create_volume(self.context, host=CONF.host)
         volume_id = vol['id']
         self.assertTrue(os.path.exists(self.volumes_path))
         self.volume.create_volume(self.context, volume_id)
@@ -171,7 +158,8 @@ class GPFSDriverTestCase(test.TestCase):
                       'block_group_factor': '1',
                       'write_affinity_failure-group':
                       '1,1,1:2;2,1,1:2;2,0,3:4'}
-        vol = self._create_volume(size=1, metadata=attributes)
+        vol = test_utils.create_volume(self.context, host=CONF.host,
+                                       metadata=attributes)
         volume_id = vol['id']
         self.assertTrue(os.path.exists(self.volumes_path))
         self.volume.create_volume(self.context, volume_id)
@@ -179,6 +167,16 @@ class GPFSDriverTestCase(test.TestCase):
         self.assertTrue(os.path.exists(path))
         self.volume.delete_volume(self.context, volume_id)
         self.assertFalse(os.path.exists(path))
+
+    def test_migrate_volume(self):
+        """Test volume migration done by driver."""
+        loc = 'GPFSDriver:cindertest:openstack'
+        cap = {'location_info': loc}
+        host = {'host': 'foo', 'capabilities': cap}
+        volume = test_utils.create_volume(self.context, host=CONF.host)
+        self.driver.create_volume(volume)
+        self.driver.migrate_volume(self.context, volume, host)
+        self.driver.delete_volume(volume)
 
     def _create_snapshot(self, volume_id, size='0'):
         """Create a snapshot object."""
@@ -191,11 +189,11 @@ class GPFSDriverTestCase(test.TestCase):
         return db.snapshot_create(context.get_admin_context(), snap)
 
     def test_create_delete_snapshot(self):
-        volume_src = self._create_volume()
+        volume_src = test_utils.create_volume(self.context, host=CONF.host)
         self.volume.create_volume(self.context, volume_src['id'])
         snapCount = len(db.snapshot_get_all_for_volume(self.context,
                                                        volume_src['id']))
-        self.assertTrue(snapCount == 0)
+        self.assertEqual(snapCount, 0)
         snapshot = self._create_snapshot(volume_src['id'])
         snapshot_id = snapshot['id']
         self.volume.create_snapshot(self.context, volume_src['id'],
@@ -204,17 +202,17 @@ class GPFSDriverTestCase(test.TestCase):
                                                     snapshot['name'])))
         snapCount = len(db.snapshot_get_all_for_volume(self.context,
                                                        volume_src['id']))
-        self.assertTrue(snapCount == 1)
-        self.volume.delete_volume(self.context, volume_src['id'])
+        self.assertEqual(snapCount, 1)
         self.volume.delete_snapshot(self.context, snapshot_id)
+        self.volume.delete_volume(self.context, volume_src['id'])
         self.assertFalse(os.path.exists(os.path.join(self.volumes_path,
                                                      snapshot['name'])))
         snapCount = len(db.snapshot_get_all_for_volume(self.context,
                                                        volume_src['id']))
-        self.assertTrue(snapCount == 0)
+        self.assertEqual(snapCount, 0)
 
     def test_create_volume_from_snapshot(self):
-        volume_src = self._create_volume()
+        volume_src = test_utils.create_volume(self.context, host=CONF.host)
         self.volume.create_volume(self.context, volume_src['id'])
         snapshot = self._create_snapshot(volume_src['id'])
         snapshot_id = snapshot['id']
@@ -222,7 +220,8 @@ class GPFSDriverTestCase(test.TestCase):
                                     snapshot_id)
         self.assertTrue(os.path.exists(os.path.join(self.volumes_path,
                                                     snapshot['name'])))
-        volume_dst = self._create_volume(0, snapshot_id)
+        volume_dst = test_utils.create_volume(self.context, host=CONF.host,
+                                              snapshot_id=snapshot_id)
         self.volume.create_volume(self.context, volume_dst['id'], snapshot_id)
         self.assertEqual(volume_dst['id'], db.volume_get(
                          context.get_admin_context(),
@@ -232,14 +231,14 @@ class GPFSDriverTestCase(test.TestCase):
                          volume_dst['id']).snapshot_id)
         self.volume.delete_volume(self.context, volume_dst['id'])
 
-        self.volume.delete_volume(self.context, volume_src['id'])
         self.volume.delete_snapshot(self.context, snapshot_id)
+        self.volume.delete_volume(self.context, volume_src['id'])
 
     def test_create_cloned_volume(self):
-        volume_src = self._create_volume()
+        volume_src = test_utils.create_volume(self.context, host=CONF.host)
         self.volume.create_volume(self.context, volume_src['id'])
 
-        volume_dst = self._create_volume()
+        volume_dst = test_utils.create_volume(self.context, host=CONF.host)
         volumepath = os.path.join(self.volumes_path, volume_dst['name'])
         self.assertFalse(os.path.exists(volumepath))
 
@@ -254,14 +253,14 @@ class GPFSDriverTestCase(test.TestCase):
         self.volume.delete_volume(self.context, volume_dst['id'])
 
     def test_create_volume_from_snapshot_method(self):
-        volume_src = self._create_volume()
+        volume_src = test_utils.create_volume(self.context, host=CONF.host)
         self.volume.create_volume(self.context, volume_src['id'])
 
         snapshot = self._create_snapshot(volume_src['id'])
         snapshot_id = snapshot['id']
         self.volume.create_snapshot(self.context, volume_src['id'],
                                     snapshot_id)
-        volume_dst = self._create_volume()
+        volume_dst = test_utils.create_volume(self.context, host=CONF.host)
         self.driver.create_volume_from_snapshot(volume_dst, snapshot)
         self.assertEqual(volume_dst['id'], db.volume_get(
                          context.get_admin_context(),
@@ -270,9 +269,9 @@ class GPFSDriverTestCase(test.TestCase):
         volumepath = os.path.join(self.volumes_path, volume_dst['name'])
         self.assertTrue(os.path.exists(volumepath))
 
+        self.volume.delete_snapshot(self.context, snapshot_id)
         self.volume.delete_volume(self.context, volume_dst['id'])
         self.volume.delete_volume(self.context, volume_src['id'])
-        self.volume.delete_snapshot(self.context, snapshot_id)
 
     def test_clone_image_to_volume_with_copy_on_write_mode(self):
         """Test the function of copy_image_to_volume
@@ -284,7 +283,7 @@ class GPFSDriverTestCase(test.TestCase):
         self.stubs.Set(image_utils, 'qemu_img_info',
                        self._fake_qemu_raw_image_info)
 
-        volume = self._create_volume()
+        volume = test_utils.create_volume(self.context, host=CONF.host)
         volumepath = os.path.join(self.volumes_path, volume['name'])
         CONF.gpfs_images_share_mode = 'copy_on_write'
         self.driver.clone_image(volume,
@@ -305,7 +304,7 @@ class GPFSDriverTestCase(test.TestCase):
         self.stubs.Set(image_utils, 'qemu_img_info',
                        self._fake_qemu_raw_image_info)
 
-        volume = self._create_volume()
+        volume = test_utils.create_volume(self.context, host=CONF.host)
         volumepath = os.path.join(self.volumes_path, volume['name'])
         CONF.gpfs_images_share_mode = 'copy'
         self.driver.clone_image(volume,
@@ -325,7 +324,7 @@ class GPFSDriverTestCase(test.TestCase):
                        self._fake_qemu_raw_image_info)
 
         for share_mode in ['copy_on_write', 'copy']:
-            volume = self._create_volume()
+            volume = test_utils.create_volume(self.context, host=CONF.host)
             volumepath = os.path.join(self.volumes_path, volume['name'])
             CONF.gpfs_images_share_mode = share_mode
             CONF.gpfs_images_dir = None
@@ -345,7 +344,7 @@ class GPFSDriverTestCase(test.TestCase):
         self.stubs.Set(image_utils, 'qemu_img_info',
                        self._fake_qemu_qcow2_image_info)
 
-        volume = self._create_volume()
+        volume = test_utils.create_volume(self.context, host=CONF.host)
         CONF.gpfs_images_share_mode = 'copy'
         CONF.gpfs_images_dir = self.images_dir
         self.assertRaises(exception.ImageUnacceptable,
@@ -359,8 +358,8 @@ class GPFSDriverTestCase(test.TestCase):
 
     def test_get_volume_stats(self):
         stats = self.driver.get_volume_stats()
-        self.assertEquals(stats['volume_backend_name'], 'GPFS')
-        self.assertEquals(stats['storage_protocol'], 'file')
+        self.assertEqual(stats['volume_backend_name'], 'GPFS')
+        self.assertEqual(stats['storage_protocol'], 'file')
 
     def test_check_for_setup_error_ok(self):
         self.stubs.Set(GPFSDriver, '_get_gpfs_state',

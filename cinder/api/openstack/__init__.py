@@ -1,4 +1,4 @@
-# Copyright (c) 2013 OpenStack, LLC.
+# Copyright (c) 2013 OpenStack Foundation
 #
 # All Rights Reserved.
 #
@@ -54,10 +54,7 @@ class ProjectMapper(APIMapper):
 
 
 class APIRouter(base_wsgi.Router):
-    """
-    Routes requests on the OpenStack API to the appropriate controller
-    and method.
-    """
+    """Routes requests on the API to the appropriate controller and method."""
     ExtensionManager = None  # override in subclasses
 
     @classmethod

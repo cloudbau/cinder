@@ -1,4 +1,4 @@
-# Copyright 2011 OpenStack LLC.
+# Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -36,9 +36,7 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
     driver_cls = filter_scheduler.FilterScheduler
 
     def test_create_volume_no_hosts(self):
-        """
-        Ensure empty hosts & child_zones result in NoValidHosts exception.
-        """
+        """Ensure empty hosts/child_zones result in NoValidHosts exception."""
         def _fake_empty_call_zone_method(*args, **kwargs):
             return []
 
@@ -94,7 +92,7 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
                                               'size': 1}}
         self.mox.ReplayAll()
         weighed_host = sched._schedule(fake_context, request_spec, {})
-        self.assertTrue(weighed_host.obj is not None)
+        self.assertIsNotNone(weighed_host.obj)
 
     def test_max_attempts(self):
         self.flags(scheduler_max_attempts=4)
@@ -122,7 +120,7 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
                         filter_properties=filter_properties)
 
         # should not have retry info in the populated filter properties:
-        self.assertFalse("retry" in filter_properties)
+        self.assertNotIn("retry", filter_properties)
 
     def test_retry_attempt_one(self):
         # Test retry logic on initial scheduling attempt.

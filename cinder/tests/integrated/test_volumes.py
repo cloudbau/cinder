@@ -98,7 +98,7 @@ class VolumesTest(integrated_helpers._IntegratedTestBase):
         # It should also be in the all-volume list
         volumes = self.api.get_volumes()
         volume_names = [volume['id'] for volume in volumes]
-        self.assertTrue(created_volume_id in volume_names)
+        self.assertIn(created_volume_id, volume_names)
 
         # Wait (briefly) for creation. Delay is due to the 'message queue'
         found_volume = self._poll_while(created_volume_id, ['creating'])
@@ -122,26 +122,26 @@ class VolumesTest(integrated_helpers._IntegratedTestBase):
             id=created_volume_id)
         LOG.debug("Create_Actions: %s" % create_actions)
 
-        self.assertEquals(1, len(create_actions))
+        self.assertEqual(1, len(create_actions))
         create_action = create_actions[0]
-        self.assertEquals(create_action['id'], created_volume_id)
-        self.assertEquals(create_action['availability_zone'], 'nova')
-        self.assertEquals(create_action['size'], 1)
+        self.assertEqual(create_action['id'], created_volume_id)
+        self.assertEqual(create_action['availability_zone'], 'nova')
+        self.assertEqual(create_action['size'], 1)
 
         export_actions = fake_driver.LoggingVolumeDriver.logs_like(
             'create_export',
             id=created_volume_id)
-        self.assertEquals(1, len(export_actions))
+        self.assertEqual(1, len(export_actions))
         export_action = export_actions[0]
-        self.assertEquals(export_action['id'], created_volume_id)
-        self.assertEquals(export_action['availability_zone'], 'nova')
+        self.assertEqual(export_action['id'], created_volume_id)
+        self.assertEqual(export_action['availability_zone'], 'nova')
 
         delete_actions = fake_driver.LoggingVolumeDriver.logs_like(
             'delete_volume',
             id=created_volume_id)
-        self.assertEquals(1, len(delete_actions))
+        self.assertEqual(1, len(delete_actions))
         delete_action = export_actions[0]
-        self.assertEquals(delete_action['id'], created_volume_id)
+        self.assertEqual(delete_action['id'], created_volume_id)
 
     def test_create_volume_with_metadata(self):
         """Creates a volume with metadata."""

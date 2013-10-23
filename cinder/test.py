@@ -35,6 +35,7 @@ import mox
 from oslo.config import cfg
 import stubout
 import testtools
+from testtools import matchers
 
 from cinder.common import config  # Need to register global_opts
 from cinder.db import migration
@@ -268,53 +269,24 @@ class TestCase(testtools.TestCase):
                                     'd2value': d2value,
                                 })
 
-    def assertDictListMatch(self, L1, L2, approx_equal=False, tolerance=0.001):
-        """Assert a list of dicts are equivalent."""
-        def raise_assertion(msg):
-            L1str = str(L1)
-            L2str = str(L2)
-            base_msg = ('List of dictionaries do not match: %(msg)s '
-                        'L1: %(L1str)s L2: %(L2str)s' %
-                        {'msg': msg, 'L1str': L1str, 'L2str': L2str})
-            raise AssertionError(base_msg)
-
-        L1count = len(L1)
-        L2count = len(L2)
-        if L1count != L2count:
-            raise_assertion('Length mismatch: len(L1)=%(L1count)d != '
-                            'len(L2)=%(L2count)d' %
-                            {'L1count': L1count, 'L2count': L2count})
-
-        for d1, d2 in zip(L1, L2):
-            self.assertDictMatch(d1, d2, approx_equal=approx_equal,
-                                 tolerance=tolerance)
-
-    def assertSubDictMatch(self, sub_dict, super_dict):
-        """Assert a sub_dict is subset of super_dict."""
-        self.assertTrue(set(sub_dict.keys()).issubset(set(super_dict.keys())))
-        for k, sub_value in sub_dict.items():
-            super_value = super_dict[k]
-            if isinstance(sub_value, dict):
-                self.assertSubDictMatch(sub_value, super_value)
-            elif 'DONTCARE' in (sub_value, super_value):
-                continue
-            else:
-                self.assertEqual(sub_value, super_value)
-
-    def assertIn(self, a, b, *args, **kwargs):
-        """Python < v2.7 compatibility.  Assert 'a' in 'b'"""
+    def assertGreater(self, first, second, msg=None):
+        """Python < v2.7 compatibility.  Assert 'first' > 'second'"""
         try:
-            f = super(TestCase, self).assertIn
+            f = super(TestCase, self).assertGreater
         except AttributeError:
-            self.assertTrue(a in b, *args, **kwargs)
+            self.assertThat(first,
+                            matchers.GreaterThan(second),
+                            message=msg or '')
         else:
-            f(a, b, *args, **kwargs)
+            f(first, second, msg=msg)
 
-    def assertNotIn(self, a, b, *args, **kwargs):
-        """Python < v2.7 compatibility.  Assert 'a' NOT in 'b'"""
+    def assertGreaterEqual(self, first, second, msg=None):
+        """Python < v2.7 compatibility.  Assert 'first' >= 'second'"""
         try:
-            f = super(TestCase, self).assertNotIn
+            f = super(TestCase, self).assertGreaterEqual
         except AttributeError:
-            self.assertFalse(a in b, *args, **kwargs)
+            self.assertThat(first,
+                            matchers.Not(matchers.LessThan(second)),
+                            message=msg or '')
         else:
-            f(a, b, *args, **kwargs)
+            f(first, second, msg=msg)

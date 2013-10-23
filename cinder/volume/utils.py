@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2012 OpenStack, LLC.
+# Copyright (c) 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -198,22 +198,22 @@ def copy_volume(srcstr, deststr, size_in_m, sync=False,
 
 def supports_thin_provisioning():
     return brick_lvm.LVM.supports_thin_provisioning(
-        'sudo cinder-rootwrap %s' % CONF.rootwrap_config)
+        utils.get_root_helper())
 
 
 def get_all_volumes(vg_name=None, no_suffix=True):
     return brick_lvm.LVM.get_all_volumes(
-        'sudo cinder-rootwrap %s' % CONF.rootwrap_config,
+        utils.get_root_helper(),
         vg_name, no_suffix)
 
 
 def get_all_physical_volumes(vg_name=None, no_suffix=True):
     return brick_lvm.LVM.get_all_physical_volumes(
-        'sudo cinder-rootwrap %s' % CONF.rootwrap_config,
+        utils.get_root_helper(),
         vg_name, no_suffix)
 
 
 def get_all_volume_groups(vg_name=None, no_suffix=True):
     return brick_lvm.LVM.get_all_volume_groups(
-        'sudo cinder-rootwrap %s' % CONF.rootwrap_config,
+        utils.get_root_helper(),
         vg_name, no_suffix)

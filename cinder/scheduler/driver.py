@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010 OpenStack, LLC.
+# Copyright (c) 2010 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -60,15 +60,6 @@ class Scheduler(object):
         self.host_manager = importutils.import_object(
             CONF.scheduler_host_manager)
         self.volume_rpcapi = volume_rpcapi.VolumeAPI()
-
-    def get_host_list(self):
-        """Get a list of hosts from the HostManager."""
-        return self.host_manager.get_host_list()
-
-    def get_service_capabilities(self):
-        """Get the normalized set of capabilities for the services.
-        """
-        return self.host_manager.get_service_capabilities()
 
     def update_service_capabilities(self, service_name, host, capabilities):
         """Process a capability update from a service node."""
