@@ -25,9 +25,9 @@ import mox
 
 from cinder import context
 from cinder import exception
+from cinder.openstack.common import processutils as putils
 from cinder import test
 from cinder import utils
-from cinder.openstack.common import processutils as putils
 from cinder.volume import configuration
 from cinder.volume.drivers import xtreemfs
 
@@ -357,7 +357,7 @@ class XtreemFsDriverTestCase(test.TestCase):
         self._driver._remotefsclient._execute(
             "mount", "-t", "xtreemfs", '-o', 'allow_other',
             share, mount_path, run_as_root=True,
-            root_helper=utils.get_root_helper(),  check_exit_code=0
+            root_helper=utils.get_root_helper(), check_exit_code=0
         )
 
         self._mocker.ReplayAll()
@@ -371,7 +371,6 @@ class XtreemFsDriverTestCase(test.TestCase):
         # Mock running xtreemfs mount command to raise an error.
         self._mocker.StubOutWithMock(self._driver._remotefsclient, "_execute")
 
-
         self._driver._remotefsclient._execute(
             "mount", check_exit_code=0
         ).AndReturn(("", ""))
@@ -380,7 +379,7 @@ class XtreemFsDriverTestCase(test.TestCase):
         self._driver._remotefsclient._execute(
             "mount", "-t", "xtreemfs", '-o', 'allow_other',
             share, mount_path, run_as_root=True,
-            root_helper=utils.get_root_helper(),  check_exit_code=0
+            root_helper=utils.get_root_helper(), check_exit_code=0
         ).AndRaise(putils.ProcessExecutionError(stderr="already mounted"))
 
         self._mocker.ReplayAll()
@@ -407,7 +406,7 @@ class XtreemFsDriverTestCase(test.TestCase):
         self._driver._remotefsclient._execute(
             "mount", "-t", "xtreemfs", '-o', 'allow_other',
             share, mount_path, run_as_root=True,
-            root_helper=utils.get_root_helper(),  check_exit_code=0
+            root_helper=utils.get_root_helper(), check_exit_code=0
         )
 
         self._mocker.ReplayAll()

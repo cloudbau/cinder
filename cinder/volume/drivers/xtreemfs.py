@@ -62,7 +62,7 @@ class XtreemfsDriver(nfs.RemoteFsDriver):
             'xtreemfs', utils.get_root_helper(),
             execute=self._execute,
             xtreemfs_mount_point_base=
-                self.configuration.xtreemfs_mount_point_base)
+            self.configuration.xtreemfs_mount_point_base)
         self._mounted_shares = []
         self._states = {}
 
@@ -74,24 +74,21 @@ class XtreemfsDriver(nfs.RemoteFsDriver):
         # Check correct configuration.
         config = self.configuration.xtreemfs_shares_config
         if not config:
-            msg = (_('Missing configuration option "%s"') %
-                   'xtreemfs_shares_config')
-            LOG.error(msg)
-            raise exception.XtreemfsException(msg)
+            raise exception.XtreemfsException(
+                'Missing configuration option "xtreemfs_shares_config"'
+            )
         if not os.path.exists(config):
-            msg = (_("Xtreemfs shares config file at %s doesn't exist") %
-                   config)
-            LOG.error(msg)
-            raise exception.XtreemfsException(msg)
+            raise exception.XtreemfsException(
+                "Xtreemfs shares config file at %s doesn't exist" % config
+            )
         # Check if XtreemFS is installed.
         try:
             self._execute("mount.xtreemfs", check_exit_code=False,
                           run_as_root=True)
         except OSError as exc:
             if exc.errno == errno.ENOENT:
-                msg = _('%s is not installed') % "mount.xtreemfs"
-                LOG.error(msg)
-                raise exception.XtreemfsException(msg)
+                raise exception.XtreemfsException(
+                    'mount.xtreemfs is not installed')
             else:
                 raise
         # Mount all available shares locally.
@@ -113,7 +110,7 @@ class XtreemfsDriver(nfs.RemoteFsDriver):
         """Read and return available shares from configuration file."""
         with open(self.configuration.xtreemfs_shares_config) as conf:
             return [share.strip() for share in conf
-                      if share and not share.startswith('#')]
+                    if share and not share.startswith('#')]
 
     def _get_mount_point_for_share(self, share):
         """Return local mount point for given share.
