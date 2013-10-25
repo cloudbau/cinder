@@ -105,7 +105,7 @@ class InitiatorConnector(executor.Executor):
                                 execute=execute,
                                 device_scan_attempts=device_scan_attempts,
                                 *args, **kwargs)
-        elif protocol == "NFS" or protocol == "GLUSTERFS":
+        elif protocol in ("NFS", "XTREEMFS", "GLUSTERFS"):
             return RemoteFsConnector(mount_type=protocol.lower(),
                                      root_helper=root_helper,
                                      driver=driver,

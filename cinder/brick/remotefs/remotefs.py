@@ -46,6 +46,12 @@ class RemoteFsClient(object):
                 raise exception.InvalidParameterValue(
                     err=_('glusterfs_mount_point_base required'))
             self._mount_options = None
+        elif mount_type == "xtreemfs":
+            self._mount_base = kwargs.get('xtreemfs_mount_point_base', None)
+            if not self._mount_base:
+                raise exception.InvalidParameterValue(
+                    err=_('xtreemfs_mount_point_base required'))
+            self._mount_options = 'allow_other'
         else:
             raise exception.ProtocolNotSupported(protocol=mount_type)
         self.root_helper = root_helper

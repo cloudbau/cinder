@@ -641,3 +641,15 @@ class QoSSpecsInUse(CinderException):
 
 class KeyManagerError(CinderException):
     msg_fmt = _("key manager error: %(reason)s")
+
+
+class XtreemfsException(CinderException):
+    message = _("Xtreemfs misconfiguration")
+
+
+class XtreemfsNoSharesMounted(NotFound):
+    message = _("No mounted Xtreemfs shares was found")
+
+
+class XtreemfsNoSuitableShareFound(NotFound):
+    message = _("No suitable share was found to host %(volume_size)dG")
