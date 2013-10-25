@@ -1657,21 +1657,6 @@
 # in one shot. Server may still limit the count to something
 # less than the configured value. (integer value)
 #vmware_max_objects_retrieval=100
-#
-
-# options for cinder.volumes.drivers.xtreemfs.xtreemfs
-#
-
-# File with the list of available xtreemfs shares. (string value)
-#xtreemfs_shares_config=/etc/cinder/shares.txt
-
-# Base dir where xtreemfs expected to be mounted. (string value)
-#xtreemfs_mount_point_base=$state_path/mnt
-
-# Create volumes as sparsed files which take no space. If set
-# to False volume is created as regular file. In such case
-# volume creation takes a lot of time. (boolean value)
-#xtreemfs_sparsed_volumes=true
 
 
 #
@@ -1716,6 +1701,24 @@
 # Connection type to the IBM Storage Array
 # (fibre_channel|iscsi) (string value)
 #xiv_ds8k_connection_type=iscsi
+
+
+#
+# Options defined in cinder.volume.drivers.xtreemfs
+#
+
+# File with the list of available xtreemfs shares, i.e.
+# <xtreemfs-dir-service-url>/<share-name> (string value)
+#xtreemfs_shares_config=/etc/cinder/xtreemfs_shares
+
+# Base dir where xtreemfs expected to be mounted (string
+# value)
+#xtreemfs_mount_point_base=$state_path/mnt
+
+# Create volumes as sparsed files which take no space.If set
+# to False volume is created as regular file.In such case
+# volume creation takes a lot of time. (boolean value)
+#xtreemfs_sparsed_volumes=true
 
 
 #
@@ -1789,4 +1792,4 @@
 #volume_dd_blocksize=1M
 
 
-# Total option count: 382
+# Total option count: 385
