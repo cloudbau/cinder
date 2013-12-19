@@ -171,6 +171,10 @@ class LVMVolumeDriver(driver.VolumeDriver):
                             self.configuration.lvm_type,
                             self.configuration.lvm_mirrors)
 
+        # Some configurations of LVM do not automatically activate
+        # ThinLVM snapshot LVs.
+        self.vg.activate_lv(snapshot['name'], is_snapshot=True)
+
         volutils.copy_volume(self.local_path(snapshot),
                              self.local_path(volume),
                              snapshot['volume_size'] * 1024,
@@ -280,7 +284,7 @@ class LVMVolumeDriver(driver.VolumeDriver):
         image_utils.fetch_to_raw(context,
                                  image_service,
                                  image_id,
-                                 self.local_path(volume))
+                                 self.local_path(volume), size=volume['size'])
 
     def copy_volume_to_image(self, context, volume, image_service, image_meta):
         """Copy the volume to the specified image."""
@@ -709,7 +713,9 @@ class LVMISCSIDriver(LVMVolumeDriver, driver.ISCSIDriver):
                 return false_ret
 
             helper = 'sudo cinder-rootwrap %s' % CONF.rootwrap_config
-            dest_vg_ref = lvm.LVM(dest_vg, helper, lvm_type, self._execute)
+            dest_vg_ref = lvm.LVM(dest_vg, helper,
+                                  lvm_type=lvm_type,
+                                  executor=self._execute)
             self.remove_export(ctxt, volume)
             self._create_volume(volume['name'],
                                 self._sizestr(volume['size']),
