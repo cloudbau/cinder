@@ -24,7 +24,7 @@ from oslo.config import cfg
 
 from cinder import exception
 from cinder.image import image_utils
-from cinder.openstack.common import fileutils
+from cinder.openstack.common import fileutils, processutils
 from cinder.openstack.common import log as logging
 from cinder import units
 from cinder.volume import driver
@@ -624,13 +624,11 @@ class RBDDriver(driver.VolumeDriver):
             if clone_snap is None:
                 LOG.debug(_("deleting rbd volume %s") % (volume_name))
                 try:
-                    self.rbd.RBD().remove(client.ioctx, volume_name)
-                except self.rbd.ImageBusy:
-                    msg = (_("ImageBusy error raised while deleting rbd "
-                             "volume. This may have been caused by a "
-                             "connection from a client that has crashed and, "
-                             "if so, may be resolved by retrying the delete "
-                             "after 30 seconds has elapsed."))
+                    self._try_execute('rbd', 'rm', '--pool',
+                                      self.configuration.rbd_pool,
+                                      volume_name)
+                except processutils.ProcessExecutionError as ex:
+                    msg = ex.stderr
                     LOG.error(msg)
                     # Now raise this so that volume stays available so that we
                     # delete can be retried.
