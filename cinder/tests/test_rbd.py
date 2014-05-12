@@ -26,7 +26,7 @@ from cinder import db
 from cinder import exception
 from cinder.image import image_utils
 from cinder.openstack.common import log as logging
-from cinder.openstack.common import timeutils
+from cinder.openstack.common import timeutils, processutils as putils
 from cinder import test
 from cinder.tests.backup.fake_rados import mock_rados
 from cinder.tests.backup.fake_rados import mock_rbd
@@ -146,20 +146,26 @@ class RBDTestCase(test.TestCase):
         self.driver.rbd = _mock_rbd
         self.driver.rados = _mock_rados
 
+        self.mox.StubOutWithMock(self.driver, '_try_execute')
+        self.driver._try_execute('rbd', 'rm', '--pool',
+                                 self.configuration.rbd_pool, name)
+
         mpo = mock.patch.object
         with mpo(driver, 'RADOSClient') as mock_rados_client:
             with mpo(self.driver, '_get_clone_info') as mock_get_clone_info:
                 mock_get_clone_info.return_value = (None, None, None)
                 with mpo(self.driver,
                          '_delete_backup_snaps') as mock_del_backup_snaps:
+
+                    self.mox.ReplayAll()
                     self.driver.delete_volume(volume)
+                    self.mox.VerifyAll()
 
                     self.assertTrue(mock_get_clone_info.called)
                     self.assertTrue(_mock_rbd.Image.list_snaps.called)
                     self.assertTrue(mock_rados_client.called)
                     self.assertTrue(mock_del_backup_snaps.called)
                     self.assertFalse(mock_rbd.Image.unprotect_snap.called)
-                    self.assertTrue(_mock_rbd.RBD.remove.called)
 
     @mock.patch('cinder.volume.drivers.rbd.rados')
     @mock.patch('cinder.volume.drivers.rbd.rbd')
@@ -172,13 +178,11 @@ class RBDTestCase(test.TestCase):
         _mock_rbd.Image.list_snaps.return_value = []
         _mock_rbd.Image.unprotect_snap = mock.Mock()
 
-        class MyMockException(Exception):
-            pass
-
-        _mock_rbd.RBD = mock_rbd.RBD
-        _mock_rbd.ImageBusy = MyMockException
-        _mock_rbd.RBD.remove = mock.Mock()
-        _mock_rbd.RBD.remove.side_effect = _mock_rbd.ImageBusy
+        self.mox.StubOutWithMock(self.driver, '_try_execute')
+        self.driver._try_execute('rbd', 'rm', '--pool',
+                                 self.configuration.rbd_pool, name).\
+                    AndRaise(putils.ProcessExecutionError(
+                             stderr="Volume is Busy"))
 
         self.driver.rbd = _mock_rbd
         self.driver.rados = _mock_rados
@@ -190,16 +194,18 @@ class RBDTestCase(test.TestCase):
                 with mpo(self.driver,
                          '_delete_backup_snaps') as mock_del_backup_snaps:
 
+                    self.mox.ReplayAll()
                     self.assertRaises(exception.VolumeIsBusy,
                                       self.driver.delete_volume,
                                       volume)
+                    self.mox.VerifyAll()
 
                     self.assertTrue(mock_get_clone_info.called)
                     self.assertTrue(_mock_rbd.Image.list_snaps.called)
                     self.assertTrue(mock_rados_client.called)
                     self.assertTrue(mock_del_backup_snaps.called)
                     self.assertFalse(mock_rbd.Image.unprotect_snap.called)
-                    self.assertTrue(_mock_rbd.RBD.remove.called)
+
 
     def test_create_snapshot(self):
         vol_name = u'volume-00000001'
