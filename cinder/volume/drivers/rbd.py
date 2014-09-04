@@ -624,9 +624,10 @@ class RBDDriver(driver.VolumeDriver):
             if clone_snap is None:
                 LOG.debug(_("deleting rbd volume %s") % (volume_name))
                 try:
-                    self._try_execute('rbd', 'rm', '--pool',
-                                      self.configuration.rbd_pool,
-                                      volume_name)
+                    args = ['rbd', 'rm', '--pool', self.configuration.rbd_pool,
+                            volume_name]
+                    args.extend(self._ceph_args())
+                    self._try_execute(*args)
                 except processutils.ProcessExecutionError as ex:
                     msg = ex.stderr
                     LOG.error(msg)
