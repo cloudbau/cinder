@@ -74,15 +74,16 @@ class BrickLvmTestCase(test.TestCase):
             data = "  LVM version:     2.02.95(2) (2012-03-06)\n"
         elif 'vgs, --noheadings, -o uuid, fake-volumes' in cmd_string:
             data = "  kVxztV-dKpG-Rz7E-xtKY-jeju-QsYU-SLG6Z1\n"
-        elif 'vgs, --noheadings, --unit=g, -o, name,size,free,lv_count,uuid'\
-                in cmd_string:
-            data = "  fake-volumes:10.00g:10.00g:0:"\
+        elif 'vgs, --noheadings, --unit=g, ' \
+             '-o, name,size,free,lv_count,uuid, ' \
+             '--separator, :, --nosuffix' in cmd_string:
+            data = "  fake-volumes:10.00:10.00:0:"\
                    "kVxztV-dKpG-Rz7E-xtKY-jeju-QsYU-SLG6Z1\n"
             if 'fake-volumes' in cmd_string:
                 return (data, "")
-            data += "  fake-volumes-2:10.00g:10.00g:0:"\
+            data += "  fake-volumes-2:10.00:10.00:0:"\
                     "lWyauW-dKpG-Rz7E-xtKY-jeju-QsYU-SLG7Z2\n"
-            data += "  fake-volumes-3:10.00g:10.00g:0:"\
+            data += "  fake-volumes-3:10.00:10.00:0:"\
                     "mXzbuX-dKpG-Rz7E-xtKY-jeju-QsYU-SLG8Z3\n"
         elif 'lvs, --noheadings, --unit=g, -o, vg_name,name,size'\
                 in cmd_string:
@@ -99,6 +100,9 @@ class BrickLvmTestCase(test.TestCase):
             data = "  fake-volumes:/dev/sda:10.00g:8.99g\n"
             data += "  fake-volumes-2:/dev/sdb:10.00g:8.99g\n"
             data += "  fake-volumes-3:/dev/sdc:10.00g:8.99g\n"
+        elif 'lvs, --noheadings, --unit=g, -o, size,data_percent, ' \
+             '--separator, :' in cmd_string:
+            data = "  9:12\n"
         else:
             pass
 
@@ -211,6 +215,24 @@ class BrickLvmTestCase(test.TestCase):
         self.assertFalse(self.vg.supports_lvchange_ignoreskipactivation)
 
         self.vg._supports_lvchange_ignoreskipactivation = None
+
+    def test_thin_pool_creation(self):
+
+        # The size of fake-volumes volume group is 10g, so the calculated thin
+        # pool size should be 9.5g (95% of 10g).
+        self.assertEqual("9.5g", self.vg.create_thin_pool())
+
+        # Passing a size parameter should result in a thin pool of that exact
+        # size.
+        for size in ("1g", "1.2g", "1.75g"):
+            self.assertEqual(size, self.vg.create_thin_pool(size_str=size))
+
+    def test_thin_pool_free_space(self):
+        # The size of fake-volumes-pool is 9g and the allocated data sums up to
+        # 12% so the calculated free space should be 7.92
+        self.assertEqual(float("7.92"),
+                         self.vg._get_thin_pool_free_space("fake-vg",
+                                                           "fake-vg-pool"))
 
     def test_volume_create_after_thin_creation(self):
         """Test self.vg.vg_thin_pool is set to pool_name

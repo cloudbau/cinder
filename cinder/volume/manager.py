@@ -264,7 +264,15 @@ class VolumeManager(manager.SchedulerDependentManager):
     def delete_volume(self, context, volume_id):
         """Deletes and unexports volume."""
         context = context.elevated()
-        volume_ref = self.db.volume_get(context, volume_id)
+
+        try:
+            volume_ref = self.db.volume_get(context, volume_id)
+        except exception.VolumeNotFound:
+            # NOTE(thingee): It could be possible for a volume to
+            # be deleted when resuming deletes from init_host().
+            LOG.info(_("Tried to delete volume %s, but it no longer exists, "
+                       "moving on") % (volume_id))
+            return True
 
         if context.project_id != volume_ref['project_id']:
             project_id = volume_ref['project_id']
@@ -699,7 +707,30 @@ class VolumeManager(manager.SchedulerDependentManager):
         # NOTE(jdg): need elevated context as we haven't "given" the vol
         # yet
         volume_ref = self.db.volume_get(context.elevated(), volume_id)
-        self.driver.accept_transfer(context, volume_ref, new_user, new_project)
+
+        # NOTE(jdg): Some drivers tie provider info (CHAP) to tenant
+        # for those that do allow them to return updated model info
+        model_update = self.driver.accept_transfer(context,
+                                                   volume_ref,
+                                                   new_user,
+                                                   new_project)
+
+        if model_update:
+            try:
+                self.db.volume_update(context,
+                                      volume_id,
+                                      model_update)
+            except exception.CinderException:
+                with excutils.save_and_reraise_exception():
+                    LOG.exception(_("Failed updating model of "
+                                    "volume %(volume_id)s "
+                                    "with drivers update %(model)s "
+                                    "during xfr.") %
+                                  {'volume_id': volume_id,
+                                   'model': model_update})
+                    self.db.volume_update(context.elevated(),
+                                          volume_id,
+                                          {'status': 'error'})
 
     def _migrate_volume_generic(self, ctxt, volume, host):
         rpcapi = volume_rpcapi.VolumeAPI()

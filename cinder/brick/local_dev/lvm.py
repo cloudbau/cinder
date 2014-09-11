@@ -64,6 +64,7 @@ class LVM(executor.Executor):
         self.vg_uuid = None
         self.vg_thin_pool = None
         self.vg_thin_pool_size = 0
+        self.vg_thin_pool_free_space = 0
         self._supports_snapshot_lv_activation = None
         self._supports_lvchange_ignoreskipactivation = None
 
@@ -83,12 +84,16 @@ class LVM(executor.Executor):
             LOG.error(_('Unable to locate Volume Group %s') % vg_name)
             raise exception.VolumeGroupNotFound(vg_name=vg_name)
 
+        # NOTE: we assume that the VG has been activated outside of Cinder
+
         if lvm_type == 'thin':
             pool_name = "%s-pool" % self.vg_name
             if self.get_volume(pool_name) is None:
                 self.create_thin_pool(pool_name)
             else:
                 self.vg_thin_pool = pool_name
+
+            self.activate_lv(self.vg_thin_pool)
 
     def _vg_exists(self):
         """Simple check to see if VG exists.
@@ -120,6 +125,43 @@ class LVM(executor.Executor):
             return out.split()
         else:
             return []
+
+    def _get_thin_pool_free_space(self, vg_name, thin_pool_name):
+        """Returns available thin pool free space.
+
+        :param vg_name: the vg where the pool is placed
+        :param thin_pool_name: the thin pool to gather info for
+        :returns: Free space, calculated after the data_percent value
+
+        """
+        cmd = ['env', 'LC_ALL=C', 'LANG=C', 'lvs', '--noheadings', '--unit=g',
+               '-o', 'size,data_percent', '--separator', ':', '--nosuffix']
+
+        # NOTE(gfidente): data_percent only applies to some types of LV so we
+        # make sure to append the actual thin pool name
+        cmd.append("/dev/%s/%s" % (vg_name, thin_pool_name))
+
+        free_space = 0
+
+        try:
+            (out, err) = self._execute(*cmd,
+                                       root_helper=self._root_helper,
+                                       run_as_root=True)
+            if out is not None:
+                out = out.strip()
+                data = out.split(':')
+                pool_size = float(data[0])
+                data_percent = float(data[1])
+                consumed_space = pool_size / 100 * data_percent
+                free_space = pool_size - consumed_space
+                free_space = round(free_space, 2)
+        except putils.ProcessExecutionError as err:
+            LOG.exception(_('Error querying thin pool about data_percent'))
+            LOG.error(_('Cmd     :%s') % err.cmd)
+            LOG.error(_('StdOut  :%s') % err.stdout)
+            LOG.error(_('StdErr  :%s') % err.stderr)
+
+        return free_space
 
     @staticmethod
     def get_lvm_version(root_helper):
@@ -355,8 +397,31 @@ class LVM(executor.Executor):
             for lv in self.get_all_volumes(self._root_helper, self.vg_name):
                 if lv['name'] == self.vg_thin_pool:
                     self.vg_thin_pool_size = lv['size']
+                    tpfs = self._get_thin_pool_free_space(self.vg_name,
+                                                          self.vg_thin_pool)
+                    self.vg_thin_pool_free_space = tpfs
 
-    def create_thin_pool(self, name=None, size_str=0):
+    def _calculate_thin_pool_size(self):
+        """Calculates the correct size for a thin pool.
+
+        Ideally we would use 100% of the containing volume group and be done.
+        But the 100%VG notation to lvcreate is not implemented and thus cannot
+        be used.  See https://bugzilla.redhat.com/show_bug.cgi?id=998347
+
+        Further, some amount of free space must remain in the volume group for
+        metadata for the contained logical volumes.  The exact amount depends
+        on how much volume sharing you expect.
+
+        :returns: An lvcreate-ready string for the number of calculated bytes.
+        """
+
+        # make sure volume group information is current
+        self.update_volume_group_info()
+
+        # leave 5% free for metadata
+        return "%sg" % (float(self.vg_free_space) * 0.95)
+
+    def create_thin_pool(self, name=None, size_str=None):
         """Creates a thin provisioning pool for this VG.
 
         The syntax here is slightly different than the default
@@ -365,6 +430,7 @@ class LVM(executor.Executor):
 
         :param name: Name to use for pool, default is "<vg-name>-pool"
         :param size_str: Size to allocate for pool, default is entire VG
+        :returns: The size string passed to the lvcreate command
 
         """
 
@@ -377,20 +443,19 @@ class LVM(executor.Executor):
         if name is None:
             name = '%s-pool' % self.vg_name
 
-        if size_str == 0:
-            self.update_volume_group_info()
-            size_str = self.vg_size
+        self.vg_pool_name = '%s/%s' % (self.vg_name, name)
 
-        # NOTE(jdg): lvcreate will round up extents
-        # to avoid issues, let's chop the size off to an int
-        size_str = re.sub(r'\.\d*', '', size_str)
-        pool_path = '%s/%s' % (self.vg_name, name)
-        cmd = ['lvcreate', '-T', '-L', size_str, pool_path]
+        if not size_str:
+            size_str = self._calculate_thin_pool_size()
+
+        cmd = ['lvcreate', '-T', '-L', size_str, self.vg_pool_name]
 
         self._execute(*cmd,
                       root_helper=self._root_helper,
                       run_as_root=True)
+
         self.vg_thin_pool = name
+        return size_str
 
     def create_volume(self, name, size_str, lv_type='default', mirror_count=0):
         """Creates a logical volume on the object's VG.
